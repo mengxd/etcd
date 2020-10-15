@@ -18,13 +18,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/coreos/etcd/etcdserver/etcdserverpb"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 )
 
 func TestCtlV3MemberList(t *testing.T)          { testCtl(t, memberListTest) }
+func TestCtlV3MemberListWithHex(t *testing.T)   { testCtl(t, memberListWithHexTest) }
 func TestCtlV3MemberListNoTLS(t *testing.T)     { testCtl(t, memberListTest, withCfg(configNoTLS)) }
 func TestCtlV3MemberListClientTLS(t *testing.T) { testCtl(t, memberListTest, withCfg(configClientTLS)) }
 func TestCtlV3MemberListClientAutoTLS(t *testing.T) {
@@ -59,9 +61,10 @@ func TestCtlV3MemberAddClientTLS(t *testing.T) { testCtl(t, memberAddTest, withC
 func TestCtlV3MemberAddClientAutoTLS(t *testing.T) {
 	testCtl(t, memberAddTest, withCfg(configClientAutoTLS))
 }
-func TestCtlV3MemberAddPeerTLS(t *testing.T)  { testCtl(t, memberAddTest, withCfg(configPeerTLS)) }
-func TestCtlV3MemberUpdate(t *testing.T)      { testCtl(t, memberUpdateTest) }
-func TestCtlV3MemberUpdateNoTLS(t *testing.T) { testCtl(t, memberUpdateTest, withCfg(configNoTLS)) }
+func TestCtlV3MemberAddPeerTLS(t *testing.T)    { testCtl(t, memberAddTest, withCfg(configPeerTLS)) }
+func TestCtlV3MemberAddForLearner(t *testing.T) { testCtl(t, memberAddForLearnerTest) }
+func TestCtlV3MemberUpdate(t *testing.T)        { testCtl(t, memberUpdateTest) }
+func TestCtlV3MemberUpdateNoTLS(t *testing.T)   { testCtl(t, memberUpdateTest, withCfg(configNoTLS)) }
 func TestCtlV3MemberUpdateClientTLS(t *testing.T) {
 	testCtl(t, memberUpdateTest, withCfg(configClientTLS))
 }
@@ -109,6 +112,52 @@ func getMemberList(cx ctlCtx) (etcdserverpb.MemberListResponse, error) {
 	return resp, nil
 }
 
+func memberListWithHexTest(cx ctlCtx) {
+	resp, err := getMemberList(cx)
+	if err != nil {
+		cx.t.Fatalf("getMemberList error (%v)", err)
+	}
+
+	cmdArgs := append(cx.PrefixArgs(), "--write-out", "json", "--hex", "member", "list")
+
+	proc, err := spawnCmd(cmdArgs)
+	if err != nil {
+		cx.t.Fatalf("memberListWithHexTest error (%v)", err)
+	}
+	var txt string
+	txt, err = proc.Expect("members")
+	if err != nil {
+		cx.t.Fatalf("memberListWithHexTest error (%v)", err)
+	}
+	if err = proc.Close(); err != nil {
+		cx.t.Fatalf("memberListWithHexTest error (%v)", err)
+	}
+	hexResp := etcdserverpb.MemberListResponse{}
+	dec := json.NewDecoder(strings.NewReader(txt))
+	if err := dec.Decode(&hexResp); err == io.EOF {
+		cx.t.Fatalf("memberListWithHexTest error (%v)", err)
+	}
+	num := len(resp.Members)
+	hexNum := len(hexResp.Members)
+	if num != hexNum {
+		cx.t.Fatalf("member number,expected %d,got %d", num, hexNum)
+	}
+	if num == 0 {
+		cx.t.Fatal("member number is 0")
+	}
+	for i := 0; i < num; i++ {
+		if resp.Members[i].Name != hexResp.Members[i].Name {
+			cx.t.Fatalf("member name,expected %v,got %v", resp.Members[i].Name, hexResp.Members[i].Name)
+		}
+		if !reflect.DeepEqual(resp.Members[i].PeerURLs, hexResp.Members[i].PeerURLs) {
+			cx.t.Fatalf("member peerURLs,expected %v,got %v", resp.Members[i].PeerURLs, hexResp.Members[i].PeerURLs)
+		}
+		if !reflect.DeepEqual(resp.Members[i].ClientURLs, hexResp.Members[i].ClientURLs) {
+			cx.t.Fatalf("member clientURLS,expected %v,got %v", resp.Members[i].ClientURLs, hexResp.Members[i].ClientURLs)
+		}
+	}
+}
+
 func memberRemoveTest(cx ctlCtx) {
 	ep, memIDToRemove, clusterID := cx.memberToRemove()
 	if err := ctlV3MemberRemove(cx, ep, memIDToRemove, clusterID); err != nil {
@@ -122,13 +171,22 @@ func ctlV3MemberRemove(cx ctlCtx, ep, memberID, clusterID string) error {
 }
 
 func memberAddTest(cx ctlCtx) {
-	if err := ctlV3MemberAdd(cx, fmt.Sprintf("http://localhost:%d", etcdProcessBasePort+11)); err != nil {
+	if err := ctlV3MemberAdd(cx, fmt.Sprintf("http://localhost:%d", etcdProcessBasePort+11), false); err != nil {
 		cx.t.Fatal(err)
 	}
 }
 
-func ctlV3MemberAdd(cx ctlCtx, peerURL string) error {
+func memberAddForLearnerTest(cx ctlCtx) {
+	if err := ctlV3MemberAdd(cx, fmt.Sprintf("http://localhost:%d", etcdProcessBasePort+11), true); err != nil {
+		cx.t.Fatal(err)
+	}
+}
+
+func ctlV3MemberAdd(cx ctlCtx, peerURL string, isLearner bool) error {
 	cmdArgs := append(cx.PrefixArgs(), "member", "add", "newmember", fmt.Sprintf("--peer-urls=%s", peerURL))
+	if isLearner {
+		cmdArgs = append(cmdArgs, "--learner")
+	}
 	return spawnWithExpect(cmdArgs, " added to cluster ")
 }
 

@@ -21,9 +21,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coreos/etcd/pkg/fileutil"
-	"github.com/coreos/etcd/pkg/testutil"
-	"github.com/coreos/etcd/version"
+	"go.etcd.io/etcd/api/v3/version"
+	"go.etcd.io/etcd/pkg/v3/fileutil"
+	"go.etcd.io/etcd/pkg/v3/testutil"
 )
 
 // TestReleaseUpgrade ensures that changes to master branch does not affect
@@ -38,10 +38,10 @@ func TestReleaseUpgrade(t *testing.T) {
 
 	copiedCfg := configNoTLS
 	copiedCfg.execPath = lastReleaseBinary
-	copiedCfg.snapCount = 3
+	copiedCfg.snapshotCount = 3
 	copiedCfg.baseScheme = "unix" // to avoid port conflict
 
-	epc, err := newEtcdProcessCluster(&copiedCfg)
+	epc, err := newEtcdProcessCluster(t, &copiedCfg)
 	if err != nil {
 		t.Fatalf("could not start etcd process cluster (%v)", err)
 	}
@@ -54,7 +54,7 @@ func TestReleaseUpgrade(t *testing.T) {
 	// so there's a window at boot time where it doesn't have V3rpcCapability enabled
 	// poll /version until etcdcluster is >2.3.x before making v3 requests
 	for i := 0; i < 7; i++ {
-		if err = cURLGet(epc, cURLReq{endpoint: "/version", expected: `"etcdcluster":"` + version.Cluster(version.Version)}); err != nil {
+		if err = cURLGet(epc, cURLReq{endpoint: "/version", expected: `"etcdcluster":"3.`}); err != nil {
 			t.Logf("#%d: v3 is not ready yet (%v)", i, err)
 			time.Sleep(time.Second)
 			continue
@@ -101,6 +101,22 @@ func TestReleaseUpgrade(t *testing.T) {
 			}
 		}
 	}
+
+	// TODO: update after release candidate
+	// expect upgraded cluster version
+	// new cluster version needs more time to upgrade
+	ver := version.Cluster(version.Version)
+	for i := 0; i < 7; i++ {
+		if err = cURLGet(epc, cURLReq{endpoint: "/version", expected: `"etcdcluster":"` + ver}); err != nil {
+			t.Logf("#%d: %v is not ready yet (%v)", i, ver, err)
+			time.Sleep(time.Second)
+			continue
+		}
+		break
+	}
+	if err != nil {
+		t.Fatalf("cluster version is not upgraded (%v)", err)
+	}
 }
 
 func TestReleaseUpgradeWithRestart(t *testing.T) {
@@ -113,10 +129,10 @@ func TestReleaseUpgradeWithRestart(t *testing.T) {
 
 	copiedCfg := configNoTLS
 	copiedCfg.execPath = lastReleaseBinary
-	copiedCfg.snapCount = 10
+	copiedCfg.snapshotCount = 10
 	copiedCfg.baseScheme = "unix"
 
-	epc, err := newEtcdProcessCluster(&copiedCfg)
+	epc, err := newEtcdProcessCluster(t, &copiedCfg)
 	if err != nil {
 		t.Fatalf("could not start etcd process cluster (%v)", err)
 	}
@@ -158,7 +174,7 @@ func TestReleaseUpgradeWithRestart(t *testing.T) {
 			epc.procs[i].Config().execPath = binDir + "/etcd"
 			epc.procs[i].Config().keepDataDir = true
 			if err := epc.procs[i].Restart(); err != nil {
-				t.Fatalf("error restarting etcd process (%v)", err)
+				t.Errorf("error restarting etcd process (%v)", err)
 			}
 			wg.Done()
 		}(i)

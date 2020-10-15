@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
+	"go.etcd.io/etcd/v3/clientv3"
 )
 
 func TestCtlV3Alarm(t *testing.T) {
@@ -37,7 +37,7 @@ func alarmTest(cx ctlCtx) {
 	}
 
 	// write some chunks to fill up the database
-	buf := strings.Repeat("b", int(os.Getpagesize()))
+	buf := strings.Repeat("b", os.Getpagesize())
 	for {
 		if err := ctlV3Put(cx, "2nd_test", buf, ""); err != nil {
 			if !strings.Contains(err.Error(), "etcdserver: mvcc: database space exceeded") {
@@ -53,7 +53,7 @@ func alarmTest(cx ctlCtx) {
 	}
 
 	// '/health' handler should return 'false'
-	if err := cURLGet(cx.epc, cURLReq{endpoint: "/health", expected: `{"health":"false"}`}); err != nil {
+	if err := cURLGet(cx.epc, cURLReq{endpoint: "/health", expected: `{"health":"false","reason":"ALARM NOSPACE"}`}); err != nil {
 		cx.t.Fatalf("failed get with curl (%v)", err)
 	}
 

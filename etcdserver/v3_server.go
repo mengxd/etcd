@@ -17,20 +17,24 @@ package etcdserver
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
-	"fmt"
+	"strconv"
 	"time"
 
-	"github.com/coreos/etcd/auth"
-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
-	"github.com/coreos/etcd/etcdserver/membership"
-	"github.com/coreos/etcd/lease"
-	"github.com/coreos/etcd/lease/leasehttp"
-	"github.com/coreos/etcd/mvcc"
-	"github.com/coreos/etcd/raft"
+	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.etcd.io/etcd/api/v3/membershippb"
+	"go.etcd.io/etcd/pkg/v3/traceutil"
+	"go.etcd.io/etcd/v3/auth"
+	"go.etcd.io/etcd/v3/etcdserver/api/membership"
+	"go.etcd.io/etcd/v3/lease"
+	"go.etcd.io/etcd/v3/lease/leasehttp"
+	"go.etcd.io/etcd/v3/mvcc"
+	"go.etcd.io/etcd/v3/raft"
 
 	"github.com/gogo/protobuf/proto"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const (
@@ -39,6 +43,7 @@ const (
 	// However, if the committed entries are very heavy to apply, the gap might grow.
 	// We should stop accepting new proposals if the gap growing to a certain point.
 	maxGapBetweenApplyAndCommitIndex = 5000
+	traceThreshold                   = 100 * time.Millisecond
 )
 
 type RaftKV interface {
@@ -69,6 +74,7 @@ type Lessor interface {
 type Authenticator interface {
 	AuthEnable(ctx context.Context, r *pb.AuthEnableRequest) (*pb.AuthEnableResponse, error)
 	AuthDisable(ctx context.Context, r *pb.AuthDisableRequest) (*pb.AuthDisableResponse, error)
+	AuthStatus(ctx context.Context, r *pb.AuthStatusRequest) (*pb.AuthStatusResponse, error)
 	Authenticate(ctx context.Context, r *pb.AuthenticateRequest) (*pb.AuthenticateResponse, error)
 	UserAdd(ctx context.Context, r *pb.AuthUserAddRequest) (*pb.AuthUserAddResponse, error)
 	UserDelete(ctx context.Context, r *pb.AuthUserDeleteRequest) (*pb.AuthUserDeleteResponse, error)
@@ -86,28 +92,47 @@ type Authenticator interface {
 }
 
 func (s *EtcdServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeResponse, error) {
-	defer warnOfExpensiveReadOnlyRangeRequest(s.getLogger(), time.Now(), r)
+	trace := traceutil.New("range",
+		s.getLogger(),
+		traceutil.Field{Key: "range_begin", Value: string(r.Key)},
+		traceutil.Field{Key: "range_end", Value: string(r.RangeEnd)},
+	)
+	ctx = context.WithValue(ctx, traceutil.TraceKey, trace)
+
+	var resp *pb.RangeResponse
+	var err error
+	defer func(start time.Time) {
+		warnOfExpensiveReadOnlyRangeRequest(s.getLogger(), start, r, resp, err)
+		if resp != nil {
+			trace.AddField(
+				traceutil.Field{Key: "response_count", Value: len(resp.Kvs)},
+				traceutil.Field{Key: "response_revision", Value: resp.Header.Revision},
+			)
+		}
+		trace.LogIfLong(traceThreshold)
+	}(time.Now())
 
 	if !r.Serializable {
-		err := s.linearizableReadNotify(ctx)
+		err = s.linearizableReadNotify(ctx)
+		trace.Step("agreement among raft nodes before linearized reading")
 		if err != nil {
 			return nil, err
 		}
 	}
-	var resp *pb.RangeResponse
-	var err error
 	chk := func(ai *auth.AuthInfo) error {
 		return s.authStore.IsRangePermitted(ai, r.Key, r.RangeEnd)
 	}
 
-	get := func() { resp, err = s.applyV3Base.Range(nil, r) }
+	get := func() { resp, err = s.applyV3Base.Range(ctx, nil, r) }
 	if serr := s.doSerialize(ctx, chk, get); serr != nil {
-		return nil, serr
+		err = serr
+		return nil, err
 	}
 	return resp, err
 }
 
 func (s *EtcdServer) Put(ctx context.Context, r *pb.PutRequest) (*pb.PutResponse, error) {
+	ctx = context.WithValue(ctx, traceutil.StartTimeKey, time.Now())
 	resp, err := s.raftRequest(ctx, pb.InternalRaftRequest{Put: r})
 	if err != nil {
 		return nil, err
@@ -125,8 +150,14 @@ func (s *EtcdServer) DeleteRange(ctx context.Context, r *pb.DeleteRangeRequest) 
 
 func (s *EtcdServer) Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse, error) {
 	if isTxnReadonly(r) {
+		trace := traceutil.New("transaction",
+			s.getLogger(),
+			traceutil.Field{Key: "read_only", Value: true},
+		)
+		ctx = context.WithValue(ctx, traceutil.TraceKey, trace)
 		if !isTxnSerializable(r) {
 			err := s.linearizableReadNotify(ctx)
+			trace.Step("agreement among raft nodes before linearized reading")
 			if err != nil {
 				return nil, err
 			}
@@ -137,15 +168,19 @@ func (s *EtcdServer) Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse
 			return checkTxnAuth(s.authStore, ai, r)
 		}
 
-		defer warnOfExpensiveReadOnlyRangeRequest(s.getLogger(), time.Now(), r)
+		defer func(start time.Time) {
+			warnOfExpensiveReadOnlyTxnRequest(s.getLogger(), start, r, resp, err)
+			trace.LogIfLong(traceThreshold)
+		}(time.Now())
 
-		get := func() { resp, err = s.applyV3Base.Txn(r) }
+		get := func() { resp, _, err = s.applyV3Base.Txn(ctx, r) }
 		if serr := s.doSerialize(ctx, chk, get); serr != nil {
 			return nil, serr
 		}
 		return resp, err
 	}
 
+	ctx = context.WithValue(ctx, traceutil.StartTimeKey, time.Now())
 	resp, err := s.raftRequest(ctx, pb.InternalRaftRequest{Txn: r})
 	if err != nil {
 		return nil, err
@@ -182,7 +217,18 @@ func isTxnReadonly(r *pb.TxnRequest) bool {
 }
 
 func (s *EtcdServer) Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.CompactionResponse, error) {
+	startTime := time.Now()
 	result, err := s.processInternalRaftRequestOnce(ctx, pb.InternalRaftRequest{Compaction: r})
+	trace := traceutil.TODO()
+	if result != nil && result.trace != nil {
+		trace = result.trace
+		defer func() {
+			trace.LogIfLong(traceThreshold)
+		}()
+		applyStart := result.trace.GetStartTime()
+		result.trace.SetStartTime(startTime)
+		trace.InsertStep(0, applyStart, "process raft request")
+	}
 	if r.Physical && result != nil && result.physc != nil {
 		<-result.physc
 		// The compaction is done deleting keys; the hash is now settled
@@ -191,6 +237,7 @@ func (s *EtcdServer) Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.
 		// if the compaction resumes. Force the finished compaction to
 		// commit so it won't resume following a crash.
 		s.be.ForceCommit()
+		trace.Step("physically apply compaction")
 	}
 	if err != nil {
 		return nil, err
@@ -206,6 +253,7 @@ func (s *EtcdServer) Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.
 		resp.Header = &pb.ResponseHeader{}
 	}
 	resp.Header.Revision = s.kv.Rev()
+	trace.AddField(traceutil.Field{Key: "response_revision", Value: resp.Header.Revision})
 	return resp, nil
 }
 
@@ -255,8 +303,14 @@ func (s *EtcdServer) LeaseRenew(ctx context.Context, id lease.LeaseID) (int64, e
 				return ttl, err
 			}
 		}
+		// Throttle in case of e.g. connection problems.
+		time.Sleep(50 * time.Millisecond)
 	}
-	return -1, ErrTimeout
+
+	if cctx.Err() == context.DeadlineExceeded {
+		return -1, ErrTimeout
+	}
+	return -1, ErrCanceled
 }
 
 func (s *EtcdServer) LeaseTimeToLive(ctx context.Context, r *pb.LeaseTimeToLiveRequest) (*pb.LeaseTimeToLiveResponse, error) {
@@ -299,7 +353,11 @@ func (s *EtcdServer) LeaseTimeToLive(ctx context.Context, r *pb.LeaseTimeToLiveR
 			}
 		}
 	}
-	return nil, ErrTimeout
+
+	if cctx.Err() == context.DeadlineExceeded {
+		return nil, ErrTimeout
+	}
+	return nil, ErrCanceled
 }
 
 func (s *EtcdServer) LeaseLeases(ctx context.Context, r *pb.LeaseLeasesRequest) (*pb.LeaseLeasesResponse, error) {
@@ -355,6 +413,14 @@ func (s *EtcdServer) AuthDisable(ctx context.Context, r *pb.AuthDisableRequest) 
 	return resp.(*pb.AuthDisableResponse), nil
 }
 
+func (s *EtcdServer) AuthStatus(ctx context.Context, r *pb.AuthStatusRequest) (*pb.AuthStatusResponse, error) {
+	resp, err := s.raftRequest(ctx, pb.InternalRaftRequest{AuthStatus: r})
+	if err != nil {
+		return nil, err
+	}
+	return resp.(*pb.AuthStatusResponse), nil
+}
+
 func (s *EtcdServer) Authenticate(ctx context.Context, r *pb.AuthenticateRequest) (*pb.AuthenticateResponse, error) {
 	if err := s.linearizableReadNotify(ctx); err != nil {
 		return nil, err
@@ -367,15 +433,11 @@ func (s *EtcdServer) Authenticate(ctx context.Context, r *pb.AuthenticateRequest
 		checkedRevision, err := s.AuthStore().CheckPassword(r.Name, r.Password)
 		if err != nil {
 			if err != auth.ErrAuthNotEnabled {
-				if lg != nil {
-					lg.Warn(
-						"invalid authentication was requested",
-						zap.String("user", r.Name),
-						zap.Error(err),
-					)
-				} else {
-					plog.Errorf("invalid authentication request to user %s was issued", r.Name)
-				}
+				lg.Warn(
+					"invalid authentication was requested",
+					zap.String("user", r.Name),
+					zap.Error(err),
+				)
 			}
 			return nil, err
 		}
@@ -385,9 +447,10 @@ func (s *EtcdServer) Authenticate(ctx context.Context, r *pb.AuthenticateRequest
 			return nil, err
 		}
 
+		// internalReq doesn't need to have Password because the above s.AuthStore().CheckPassword() already did it.
+		// In addition, it will let a WAL entry not record password as a plain text.
 		internalReq := &pb.InternalAuthenticateRequest{
 			Name:        r.Name,
-			Password:    r.Password,
 			SimpleToken: st,
 		}
 
@@ -399,17 +462,22 @@ func (s *EtcdServer) Authenticate(ctx context.Context, r *pb.AuthenticateRequest
 			break
 		}
 
-		if lg != nil {
-			lg.Info("revision when password checked became stale; retrying")
-		} else {
-			plog.Infof("revision when password checked is obsolete, retrying")
-		}
+		lg.Info("revision when password checked became stale; retrying")
 	}
 
 	return resp.(*pb.AuthenticateResponse), nil
 }
 
 func (s *EtcdServer) UserAdd(ctx context.Context, r *pb.AuthUserAddRequest) (*pb.AuthUserAddResponse, error) {
+	if r.Options == nil || !r.Options.NoPassword {
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(r.Password), s.authStore.BcryptCost())
+		if err != nil {
+			return nil, err
+		}
+		r.HashedPassword = base64.StdEncoding.EncodeToString(hashedPassword)
+		r.Password = ""
+	}
+
 	resp, err := s.raftRequest(ctx, pb.InternalRaftRequest{AuthUserAdd: r})
 	if err != nil {
 		return nil, err
@@ -426,6 +494,15 @@ func (s *EtcdServer) UserDelete(ctx context.Context, r *pb.AuthUserDeleteRequest
 }
 
 func (s *EtcdServer) UserChangePassword(ctx context.Context, r *pb.AuthUserChangePasswordRequest) (*pb.AuthUserChangePasswordResponse, error) {
+	if r.Password != "" {
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(r.Password), s.authStore.BcryptCost())
+		if err != nil {
+			return nil, err
+		}
+		r.HashedPassword = base64.StdEncoding.EncodeToString(hashedPassword)
+		r.Password = ""
+	}
+
 	resp, err := s.raftRequest(ctx, pb.InternalRaftRequest{AuthUserChangePassword: r})
 	if err != nil {
 		return nil, err
@@ -521,43 +598,45 @@ func (s *EtcdServer) raftRequestOnce(ctx context.Context, r pb.InternalRaftReque
 	if result.err != nil {
 		return nil, result.err
 	}
+	if startTime, ok := ctx.Value(traceutil.StartTimeKey).(time.Time); ok && result.trace != nil {
+		applyStart := result.trace.GetStartTime()
+		// The trace object is created in apply. Here reset the start time to trace
+		// the raft request time by the difference between the request start time
+		// and apply start time
+		result.trace.SetStartTime(startTime)
+		result.trace.InsertStep(0, applyStart, "process raft request")
+		result.trace.LogIfLong(traceThreshold)
+	}
 	return result.resp, nil
 }
 
 func (s *EtcdServer) raftRequest(ctx context.Context, r pb.InternalRaftRequest) (proto.Message, error) {
-	for {
-		resp, err := s.raftRequestOnce(ctx, r)
-		if err != auth.ErrAuthOldRevision {
-			return resp, err
-		}
-	}
+	return s.raftRequestOnce(ctx, r)
 }
 
 // doSerialize handles the auth logic, with permissions checked by "chk", for a serialized request "get". Returns a non-nil error on authentication failure.
 func (s *EtcdServer) doSerialize(ctx context.Context, chk func(*auth.AuthInfo) error, get func()) error {
-	for {
-		ai, err := s.AuthInfoFromCtx(ctx)
-		if err != nil {
-			return err
-		}
-		if ai == nil {
-			// chk expects non-nil AuthInfo; use empty credentials
-			ai = &auth.AuthInfo{}
-		}
-		if err = chk(ai); err != nil {
-			if err == auth.ErrAuthOldRevision {
-				continue
-			}
-			return err
-		}
-		// fetch response for serialized request
-		get()
-		//  empty credentials or current auth info means no need to retry
-		if ai.Revision == 0 || ai.Revision == s.authStore.Revision() {
-			return nil
-		}
-		// avoid TOCTOU error, retry of the request is required.
+	trace := traceutil.Get(ctx)
+	ai, err := s.AuthInfoFromCtx(ctx)
+	if err != nil {
+		return err
 	}
+	if ai == nil {
+		// chk expects non-nil AuthInfo; use empty credentials
+		ai = &auth.AuthInfo{}
+	}
+	if err = chk(ai); err != nil {
+		return err
+	}
+	trace.Step("get authentication metadata")
+	// fetch response for serialized request
+	get()
+	// check for stale token revision in case the auth store was updated while
+	// the request has been handled.
+	if ai.Revision != 0 && ai.Revision != s.authStore.Revision() {
+		return auth.ErrAuthOldRevision
+	}
+	return nil
 }
 
 func (s *EtcdServer) processInternalRaftRequestOnce(ctx context.Context, r pb.InternalRaftRequest) (*applyResult, error) {
@@ -571,13 +650,16 @@ func (s *EtcdServer) processInternalRaftRequestOnce(ctx context.Context, r pb.In
 		ID: s.reqIDGen.Next(),
 	}
 
-	authInfo, err := s.AuthInfoFromCtx(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if authInfo != nil {
-		r.Header.Username = authInfo.Username
-		r.Header.AuthRevision = authInfo.Revision
+	// check authinfo if it is not InternalAuthenticateRequest
+	if r.Authenticate == nil {
+		authInfo, err := s.AuthInfoFromCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if authInfo != nil {
+			r.Header.Username = authInfo.Username
+			r.Header.AuthRevision = authInfo.Revision
+		}
 	}
 
 	data, err := r.Marshal()
@@ -627,15 +709,21 @@ func (s *EtcdServer) linearizableReadLoop() {
 	var rs raft.ReadState
 
 	for {
-		ctx := make([]byte, 8)
-		binary.BigEndian.PutUint64(ctx, s.reqIDGen.Next())
-
+		ctxToSend := make([]byte, 8)
+		id1 := s.reqIDGen.Next()
+		binary.BigEndian.PutUint64(ctxToSend, id1)
+		leaderChangedNotifier := s.leaderChangedNotify()
 		select {
+		case <-leaderChangedNotifier:
+			continue
 		case <-s.readwaitc:
 		case <-s.stopping:
 			return
 		}
 
+		// as a single loop is can unlock multiple reads, it is not very useful
+		// to propagate the trace from Txn or Range.
+		trace := traceutil.New("linearizableReadLoop", s.getLogger())
 		nextnr := newNotifier()
 
 		s.readMu.Lock()
@@ -645,16 +733,13 @@ func (s *EtcdServer) linearizableReadLoop() {
 
 		lg := s.getLogger()
 		cctx, cancel := context.WithTimeout(context.Background(), s.Cfg.ReqTimeout())
-		if err := s.r.ReadIndex(cctx, ctx); err != nil {
+		if err := s.r.ReadIndex(cctx, ctxToSend); err != nil {
 			cancel()
 			if err == raft.ErrStopped {
 				return
 			}
-			if lg != nil {
-				lg.Warn("failed to get read index from Raft", zap.Error(err))
-			} else {
-				plog.Errorf("failed to get read index from raft: %v", err)
-			}
+			lg.Warn("failed to get read index from Raft", zap.Error(err))
+			readIndexFailed.Inc()
 			nr.notify(err)
 			continue
 		}
@@ -667,28 +752,31 @@ func (s *EtcdServer) linearizableReadLoop() {
 		for !timeout && !done {
 			select {
 			case rs = <-s.r.readStateC:
-				done = bytes.Equal(rs.RequestCtx, ctx)
+				done = bytes.Equal(rs.RequestCtx, ctxToSend)
 				if !done {
 					// a previous request might time out. now we should ignore the response of it and
 					// continue waiting for the response of the current requests.
-					if lg != nil {
-						lg.Warn(
-							"ignored out-of-date read index response",
-							zap.String("ctx-expected", fmt.Sprintf("%+v", string(rs.RequestCtx))),
-							zap.String("ctx-got", fmt.Sprintf("%+v", string(ctx))),
-						)
-					} else {
-						plog.Warningf("ignored out-of-date read index response (want %v, got %v)", rs.RequestCtx, ctx)
+					id2 := uint64(0)
+					if len(rs.RequestCtx) == 8 {
+						id2 = binary.BigEndian.Uint64(rs.RequestCtx)
 					}
+					lg.Warn(
+						"ignored out-of-date read index response; local node read indexes queueing up and waiting to be in sync with leader",
+						zap.Uint64("sent-request-id", id1),
+						zap.Uint64("received-request-id", id2),
+					)
+					slowReadIndex.Inc()
 				}
+			case <-leaderChangedNotifier:
+				timeout = true
+				readIndexFailed.Inc()
+				// return a retryable error.
+				nr.notify(ErrLeaderChanged)
 			case <-time.After(s.Cfg.ReqTimeout()):
-				if lg != nil {
-					lg.Warn("timed out waiting for read index response", zap.Duration("timeout", s.Cfg.ReqTimeout()))
-				} else {
-					plog.Warningf("timed out waiting for read index response")
-				}
+				lg.Warn("timed out waiting for read index response (local node might have slow network)", zap.Duration("timeout", s.Cfg.ReqTimeout()))
 				nr.notify(ErrTimeout)
 				timeout = true
+				slowReadIndex.Inc()
 			case <-s.stopping:
 				return
 			}
@@ -696,17 +784,31 @@ func (s *EtcdServer) linearizableReadLoop() {
 		if !done {
 			continue
 		}
+		trace.Step("read index received")
 
-		if ai := s.getAppliedIndex(); ai < rs.Index {
+		index := rs.Index
+		trace.AddField(traceutil.Field{Key: "readStateIndex", Value: index})
+
+		ai := s.getAppliedIndex()
+		trace.AddField(traceutil.Field{Key: "appliedIndex", Value: strconv.FormatUint(ai, 10)})
+
+		if ai < index {
 			select {
-			case <-s.applyWait.Wait(rs.Index):
+			case <-s.applyWait.Wait(index):
 			case <-s.stopping:
 				return
 			}
 		}
 		// unblock all l-reads requested at indices before rs.Index
 		nr.notify(nil)
+		trace.Step("applied index is now lower than readState.Index")
+
+		trace.LogAllStepsIfLong(traceThreshold)
 	}
+}
+
+func (s *EtcdServer) LinearizableReadNotify(ctx context.Context) error {
+	return s.linearizableReadNotify(ctx)
 }
 
 func (s *EtcdServer) linearizableReadNotify(ctx context.Context) error {
@@ -741,5 +843,96 @@ func (s *EtcdServer) AuthInfoFromCtx(ctx context.Context) (*auth.AuthInfo, error
 	}
 	authInfo = s.AuthStore().AuthInfoFromTLS(ctx)
 	return authInfo, nil
+}
 
+func (s *EtcdServer) Downgrade(ctx context.Context, r *pb.DowngradeRequest) (*pb.DowngradeResponse, error) {
+	switch r.Action {
+	case pb.DowngradeRequest_VALIDATE:
+		return s.downgradeValidate(ctx, r.Version)
+	case pb.DowngradeRequest_ENABLE:
+		return s.downgradeEnable(ctx, r)
+	case pb.DowngradeRequest_CANCEL:
+		return s.downgradeCancel(ctx)
+	default:
+		return nil, ErrUnknownMethod
+	}
+}
+
+func (s *EtcdServer) downgradeValidate(ctx context.Context, v string) (*pb.DowngradeResponse, error) {
+	resp := &pb.DowngradeResponse{}
+
+	targetVersion, err := convertToClusterVersion(v)
+	if err != nil {
+		return nil, err
+	}
+
+	// gets leaders commit index and wait for local store to finish applying that index
+	// to avoid using stale downgrade information
+	err = s.linearizableReadNotify(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	cv := s.ClusterVersion()
+	if cv == nil {
+		return nil, ErrClusterVersionUnavailable
+	}
+	resp.Version = cv.String()
+
+	allowedTargetVersion := membership.AllowedDowngradeVersion(cv)
+	if !targetVersion.Equal(*allowedTargetVersion) {
+		return nil, ErrInvalidDowngradeTargetVersion
+	}
+
+	downgradeInfo := s.cluster.DowngradeInfo()
+	if downgradeInfo.Enabled {
+		// Todo: return the downgrade status along with the error msg
+		return nil, ErrDowngradeInProcess
+	}
+	return resp, nil
+}
+
+func (s *EtcdServer) downgradeEnable(ctx context.Context, r *pb.DowngradeRequest) (*pb.DowngradeResponse, error) {
+	// validate downgrade capability before starting downgrade
+	v := r.Version
+	lg := s.getLogger()
+	if resp, err := s.downgradeValidate(ctx, v); err != nil {
+		lg.Warn("reject downgrade request", zap.Error(err))
+		return resp, err
+	}
+	targetVersion, err := convertToClusterVersion(v)
+	if err != nil {
+		lg.Warn("reject downgrade request", zap.Error(err))
+		return nil, err
+	}
+
+	raftRequest := membershippb.DowngradeInfoSetRequest{Enabled: true, Ver: targetVersion.String()}
+	_, err = s.raftRequest(ctx, pb.InternalRaftRequest{DowngradeInfoSet: &raftRequest})
+	if err != nil {
+		lg.Warn("reject downgrade request", zap.Error(err))
+		return nil, err
+	}
+	resp := pb.DowngradeResponse{Version: s.ClusterVersion().String()}
+	return &resp, nil
+}
+
+func (s *EtcdServer) downgradeCancel(ctx context.Context) (*pb.DowngradeResponse, error) {
+	// gets leaders commit index and wait for local store to finish applying that index
+	// to avoid using stale downgrade information
+	if err := s.linearizableReadNotify(ctx); err != nil {
+		return nil, err
+	}
+
+	downgradeInfo := s.cluster.DowngradeInfo()
+	if !downgradeInfo.Enabled {
+		return nil, ErrNoInflightDowngrade
+	}
+
+	raftRequest := membershippb.DowngradeInfoSetRequest{Enabled: false}
+	_, err := s.raftRequest(ctx, pb.InternalRaftRequest{DowngradeInfoSet: &raftRequest})
+	if err != nil {
+		return nil, err
+	}
+	resp := pb.DowngradeResponse{Version: s.ClusterVersion().String()}
+	return &resp, nil
 }

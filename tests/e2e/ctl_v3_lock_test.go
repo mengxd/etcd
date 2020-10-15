@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coreos/etcd/pkg/expect"
+	"go.etcd.io/etcd/pkg/v3/expect"
 )
 
 func TestCtlV3Lock(t *testing.T) {
@@ -84,7 +84,7 @@ func testLock(cx ctlCtx) {
 	if err = holder.Signal(os.Interrupt); err != nil {
 		cx.t.Fatal(err)
 	}
-	if err = closeWithTimeout(holder, time.Second); err != nil {
+	if err = closeWithTimeout(holder, 200*time.Millisecond+time.Second); err != nil {
 		cx.t.Fatal(err)
 	}
 

@@ -23,18 +23,18 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/coreos/etcd/etcdserver/etcdserverpb"
-	"github.com/coreos/etcd/etcdserver/membership"
-	"github.com/coreos/etcd/pkg/fileutil"
-	"github.com/coreos/etcd/pkg/idutil"
-	"github.com/coreos/etcd/pkg/pbutil"
-	"github.com/coreos/etcd/raft/raftpb"
-	"github.com/coreos/etcd/raftsnap"
-	"github.com/coreos/etcd/wal"
-	"github.com/coreos/etcd/wal/walpb"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.etcd.io/etcd/pkg/v3/fileutil"
+	"go.etcd.io/etcd/pkg/v3/idutil"
+	"go.etcd.io/etcd/pkg/v3/pbutil"
+	"go.etcd.io/etcd/v3/etcdserver/api/membership"
+	"go.etcd.io/etcd/v3/etcdserver/api/snap"
+	"go.etcd.io/etcd/v3/raft/raftpb"
+	"go.etcd.io/etcd/v3/wal"
+	"go.etcd.io/etcd/v3/wal/walpb"
 
-	bolt "github.com/coreos/bbolt"
 	"github.com/urfave/cli"
+	bolt "go.etcd.io/bbolt"
 	"go.uber.org/zap"
 )
 
@@ -103,14 +103,14 @@ func handleBackup(c *cli.Context) error {
 }
 
 func saveSnap(destSnap, srcSnap string) (walsnap walpb.Snapshot) {
-	ss := raftsnap.New(zap.NewExample(), srcSnap)
+	ss := snap.New(zap.NewExample(), srcSnap)
 	snapshot, err := ss.Load()
-	if err != nil && err != raftsnap.ErrNoSnapshot {
+	if err != nil && err != snap.ErrNoSnapshot {
 		log.Fatal(err)
 	}
 	if snapshot != nil {
 		walsnap.Index, walsnap.Term = snapshot.Metadata.Index, snapshot.Metadata.Term
-		newss := raftsnap.New(zap.NewExample(), destSnap)
+		newss := snap.New(zap.NewExample(), destSnap)
 		if err = newss.SaveSnap(*snapshot); err != nil {
 			log.Fatal(err)
 		}

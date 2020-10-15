@@ -16,15 +16,14 @@ package etcdserver
 
 import (
 	"encoding/json"
+	"fmt"
 	"path"
 	"time"
 
-	"github.com/coreos/etcd/etcdserver/api"
-	"github.com/coreos/etcd/etcdserver/membership"
-	"github.com/coreos/etcd/etcdserver/v2store"
-	"github.com/coreos/etcd/pkg/pbutil"
+	"go.etcd.io/etcd/pkg/v3/pbutil"
+	"go.etcd.io/etcd/v3/etcdserver/api/membership"
+	"go.etcd.io/etcd/v3/etcdserver/api/v2store"
 
-	"github.com/coreos/go-semver/semver"
 	"go.uber.org/zap"
 )
 
@@ -38,7 +37,10 @@ type ApplierV2 interface {
 }
 
 func NewApplierV2(lg *zap.Logger, s v2store.Store, c *membership.RaftCluster) ApplierV2 {
-	return &applierV2store{store: s, cluster: c}
+	if lg == nil {
+		lg = zap.NewNop()
+	}
+	return &applierV2store{lg: lg, store: s, cluster: c}
 }
 
 type applierV2store struct {
@@ -76,14 +78,10 @@ func (a *applierV2store) Put(r *RequestV2) Response {
 		return toResponse(a.store.CompareAndSwap(r.Path, r.PrevValue, r.PrevIndex, r.Val, ttlOptions))
 	default:
 		if storeMemberAttributeRegexp.MatchString(r.Path) {
-			id := membership.MustParseMemberIDFromKey(path.Dir(r.Path))
+			id := membership.MustParseMemberIDFromKey(a.lg, path.Dir(r.Path))
 			var attr membership.Attributes
 			if err := json.Unmarshal([]byte(r.Val), &attr); err != nil {
-				if a.lg != nil {
-					a.lg.Panic("failed to unmarshal", zap.String("value", r.Val), zap.Error(err))
-				} else {
-					plog.Panicf("unmarshal %s should never fail: %v", r.Val, err)
-				}
+				a.lg.Panic("failed to unmarshal", zap.String("value", r.Val), zap.Error(err))
 			}
 			if a.cluster != nil {
 				a.cluster.UpdateAttributes(id, attr)
@@ -91,10 +89,8 @@ func (a *applierV2store) Put(r *RequestV2) Response {
 			// return an empty response since there is no consumer.
 			return Response{}
 		}
+		// remove v2 version set to avoid the conflict between v2 and v3.
 		if r.Path == membership.StoreClusterVersionKey() {
-			if a.cluster != nil {
-				a.cluster.SetVersion(semver.Must(semver.NewVersion(r.Val)), api.UpdateCapability)
-			}
 			// return an empty response since there is no consumer.
 			return Response{}
 		}
@@ -114,7 +110,11 @@ func (a *applierV2store) Sync(r *RequestV2) Response {
 // applyV2Request interprets r as a call to v2store.X
 // and returns a Response interpreted from v2store.Event
 func (s *EtcdServer) applyV2Request(r *RequestV2) Response {
-	defer warnOfExpensiveRequest(s.getLogger(), time.Now(), r)
+	stringer := panicAlternativeStringer{
+		stringer:    r,
+		alternative: func() string { return fmt.Sprintf("id:%d,method:%s,path:%s", r.ID, r.Method, r.Path) },
+	}
+	defer warnOfExpensiveRequest(s.getLogger(), time.Now(), stringer, nil, nil)
 
 	switch r.Method {
 	case "POST":

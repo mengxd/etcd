@@ -15,7 +15,6 @@
 package embed
 
 import (
-	"crypto/tls"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -27,19 +26,22 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coreos/etcd/compactor"
-	"github.com/coreos/etcd/etcdserver"
-	"github.com/coreos/etcd/pkg/flags"
-	"github.com/coreos/etcd/pkg/netutil"
-	"github.com/coreos/etcd/pkg/srv"
-	"github.com/coreos/etcd/pkg/transport"
-	"github.com/coreos/etcd/pkg/types"
+	"go.etcd.io/etcd/pkg/v3/flags"
+	"go.etcd.io/etcd/pkg/v3/logutil"
+	"go.etcd.io/etcd/pkg/v3/netutil"
+	"go.etcd.io/etcd/pkg/v3/srv"
+	"go.etcd.io/etcd/pkg/v3/tlsutil"
+	"go.etcd.io/etcd/pkg/v3/transport"
+	"go.etcd.io/etcd/pkg/v3/types"
+	"go.etcd.io/etcd/v3/etcdserver"
+	"go.etcd.io/etcd/v3/etcdserver/api/v3compactor"
 
-	"github.com/ghodss/yaml"
+	bolt "go.etcd.io/bbolt"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc"
+	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -59,18 +61,22 @@ const (
 	DefaultListenClientURLs = "http://localhost:2379"
 
 	DefaultLogOutput = "default"
+	JournalLogOutput = "systemd/journal"
+	StdErrLogOutput  = "stderr"
+	StdOutLogOutput  = "stdout"
 
 	// DefaultStrictReconfigCheck is the default value for "--strict-reconfig-check" flag.
 	// It's enabled by default.
 	DefaultStrictReconfigCheck = true
 	// DefaultEnableV2 is the default value for "--enable-v2" flag.
-	// v2 is enabled by default.
-	// TODO: disable v2 when deprecated.
-	DefaultEnableV2 = true
+	// v2 API is disabled by default.
+	DefaultEnableV2 = false
 
 	// maxElectionMs specifies the maximum value of election timeout.
 	// More details are listed in ../Documentation/tuning.md#time-parameters.
 	maxElectionMs = 50000
+	// backend freelist map type
+	freelistArrayType = "array"
 )
 
 var (
@@ -91,7 +97,7 @@ var (
 	// If "AutoCompactionMode" is CompactorModePeriodic and
 	// "AutoCompactionRetention" is "1h", it automatically compacts
 	// compacts storage every hour.
-	CompactorModePeriodic = compactor.ModePeriodic
+	CompactorModePeriodic = v3compactor.ModePeriodic
 
 	// CompactorModeRevision is revision-based compaction mode
 	// for "Config.AutoCompactionMode" field.
@@ -99,7 +105,7 @@ var (
 	// "AutoCompactionRetention" is "1000", it compacts log on
 	// revision 5000 when the current revision is 6000.
 	// This runs every 5-minute if enough of logs have proceeded.
-	CompactorModeRevision = compactor.ModeRevision
+	CompactorModeRevision = v3compactor.ModeRevision
 )
 
 func init() {
@@ -108,12 +114,23 @@ func init() {
 
 // Config holds the arguments for configuring an etcd server.
 type Config struct {
-	Name         string `json:"name"`
-	Dir          string `json:"data-dir"`
-	WalDir       string `json:"wal-dir"`
-	SnapCount    uint64 `json:"snapshot-count"`
-	MaxSnapFiles uint   `json:"max-snapshots"`
-	MaxWalFiles  uint   `json:"max-wals"`
+	Name   string `json:"name"`
+	Dir    string `json:"data-dir"`
+	WalDir string `json:"wal-dir"`
+
+	SnapshotCount uint64 `json:"snapshot-count"`
+
+	// SnapshotCatchUpEntries is the number of entries for a slow follower
+	// to catch-up after compacting the raft storage entries.
+	// We expect the follower has a millisecond level latency with the leader.
+	// The max throughput is around 10K. Keep a 5K entries is enough for helping
+	// follower to catch up.
+	// WARNING: only change this for tests.
+	// Always use "DefaultSnapshotCatchUpEntries"
+	SnapshotCatchUpEntries uint64
+
+	MaxSnapFiles uint `json:"max-snapshots"`
+	MaxWalFiles  uint `json:"max-wals"`
 
 	// TickMs is the number of milliseconds between heartbeat ticks.
 	// TODO: decouple tickMs and heartbeat tick (current heartbeat tick = 1).
@@ -147,12 +164,18 @@ type Config struct {
 	//
 	// If single-node, it advances ticks regardless.
 	//
-	// See https://github.com/coreos/etcd/issues/9333 for more detail.
+	// See https://github.com/etcd-io/etcd/issues/9333 for more detail.
 	InitialElectionTickAdvance bool `json:"initial-election-tick-advance"`
 
-	QuotaBackendBytes int64 `json:"quota-backend-bytes"`
-	MaxTxnOps         uint  `json:"max-txn-ops"`
-	MaxRequestBytes   uint  `json:"max-request-bytes"`
+	// BackendBatchInterval is the maximum time before commit the backend transaction.
+	BackendBatchInterval time.Duration `json:"backend-batch-interval"`
+	// BackendBatchLimit is the maximum operations before commit the backend transaction.
+	BackendBatchLimit int `json:"backend-batch-limit"`
+	// BackendFreelistType specifies the type of freelist that boltdb backend uses (array and map are supported types).
+	BackendFreelistType string `json:"backend-bbolt-freelist-type"`
+	QuotaBackendBytes   int64  `json:"quota-backend-bytes"`
+	MaxTxnOps           uint   `json:"max-txn-ops"`
+	MaxRequestBytes     uint   `json:"max-request-bytes"`
 
 	LPUrls, LCUrls []url.URL
 	APUrls, ACUrls []url.URL
@@ -160,6 +183,11 @@ type Config struct {
 	ClientAutoTLS  bool
 	PeerTLSInfo    transport.TLSInfo
 	PeerAutoTLS    bool
+
+	// CipherSuites is a list of supported TLS cipher suites between
+	// client/server and peers. If empty, Go auto-populates the list.
+	// Note that cipher suites are prioritized in the given order.
+	CipherSuites []string `json:"cipher-suites"`
 
 	ClusterState          string `json:"initial-cluster-state"`
 	DNSCluster            string `json:"discovery-srv"`
@@ -226,7 +254,7 @@ type Config struct {
 	// CVE-2018-5702 reference:
 	// - https://bugs.chromium.org/p/project-zero/issues/detail?id=1447#c2
 	// - https://github.com/transmission/transmission/pull/468
-	// - https://github.com/coreos/etcd/issues/9353
+	// - https://github.com/etcd-io/etcd/issues/9353
 	HostWhitelist map[string]struct{}
 
 	// UserHandlers is for registering users handlers and only used for
@@ -246,9 +274,16 @@ type Config struct {
 	AuthToken  string `json:"auth-token"`
 	BcryptCost uint   `json:"bcrypt-cost"`
 
+	//The AuthTokenTTL in seconds of the simple token
+	AuthTokenTTL uint `json:"auth-token-ttl"`
+
 	ExperimentalInitialCorruptCheck bool          `json:"experimental-initial-corrupt-check"`
 	ExperimentalCorruptCheckTime    time.Duration `json:"experimental-corrupt-check-time"`
 	ExperimentalEnableV2V3          string        `json:"experimental-enable-v2v3"`
+	// ExperimentalEnableLeaseCheckpoint enables primary lessor to persist lease remainingTTL to prevent indefinite auto-renewal of long lived leases.
+	ExperimentalEnableLeaseCheckpoint       bool          `json:"experimental-enable-lease-checkpoint"`
+	ExperimentalCompactionBatchLimit        int           `json:"experimental-compaction-batch-limit"`
+	ExperimentalWatchProgressNotifyInterval time.Duration `json:"experimental-watch-progress-notify-interval"`
 
 	// ForceNewCluster starts a new cluster even if previously started; unsafe.
 	ForceNewCluster bool `json:"force-new-cluster"`
@@ -258,14 +293,11 @@ type Config struct {
 	ListenMetricsUrls     []url.URL
 	ListenMetricsUrlsJSON string `json:"listen-metrics-urls"`
 
-	// Logger is logger options: "zap", "capnslog".
-	// WARN: "capnslog" is being deprecated in v3.5.
+	// Logger is logger options: currently only supports "zap".
+	// "capnslog" is removed in v3.5.
 	Logger string `json:"logger"`
-
-	// DeprecatedLogOutput is to be deprecated in v3.5.
-	// Just here for safe migration in v3.4.
-	DeprecatedLogOutput []string `json:"log-output"`
-
+	// LogLevel configures log level. Only supports debug, info, warn, error, panic, or fatal. Default 'info'.
+	LogLevel string `json:"log-level"`
 	// LogOutputs is either:
 	//  - "default" as os.Stderr,
 	//  - "stderr" as os.Stderr,
@@ -274,8 +306,8 @@ type Config struct {
 	// It can be multiple when "Logger" is zap.
 	LogOutputs []string `json:"log-outputs"`
 
-	// Debug is true, to enable debug level logging.
-	Debug bool `json:"debug"`
+	// ZapLoggerBuilder is used to build the zap logger.
+	ZapLoggerBuilder func(*Config) error
 
 	// logger logs server-side operations. The default is nil,
 	// and "setupLogging" must be called before starting server.
@@ -291,12 +323,13 @@ type Config struct {
 	loggerCore        zapcore.Core
 	loggerWriteSyncer zapcore.WriteSyncer
 
-	// TO BE DEPRECATED
+	// EnableGRPCGateway enables grpc gateway.
+	// The gateway translates a RESTful HTTP API into gRPC.
+	EnableGRPCGateway bool `json:"enable-grpc-gateway"`
 
-	// LogPkgLevels is being deprecated in v3.5.
-	// Only valid if "logger" option is "capnslog".
-	// WARN: DO NOT USE THIS!
-	LogPkgLevels string `json:"log-package-levels"`
+	// UnsafeNoFsync disables all uses of fsync.
+	// Setting this is unsafe and will cause data loss.
+	UnsafeNoFsync bool `json:"unsafe-no-fsync"`
 }
 
 // configYAML holds the config suitable for yaml parsing
@@ -339,7 +372,9 @@ func NewConfig() *Config {
 
 		Name: DefaultName,
 
-		SnapCount:       etcdserver.DefaultSnapCount,
+		SnapshotCount:          etcdserver.DefaultSnapshotCount,
+		SnapshotCatchUpEntries: etcdserver.DefaultSnapshotCatchUpEntries,
+
 		MaxTxnOps:       DefaultMaxTxnOps,
 		MaxRequestBytes: DefaultMaxRequestBytes,
 
@@ -366,34 +401,21 @@ func NewConfig() *Config {
 		CORS:          map[string]struct{}{"*": {}},
 		HostWhitelist: map[string]struct{}{"*": {}},
 
-		AuthToken:  "simple",
-		BcryptCost: uint(bcrypt.DefaultCost),
+		AuthToken:    "simple",
+		BcryptCost:   uint(bcrypt.DefaultCost),
+		AuthTokenTTL: 300,
 
 		PreVote: false, // TODO: enable by default in v3.5
 
-		loggerMu:            new(sync.RWMutex),
-		logger:              nil,
-		Logger:              "capnslog",
-		DeprecatedLogOutput: []string{DefaultLogOutput},
-		LogOutputs:          []string{DefaultLogOutput},
-		Debug:               false,
-		LogPkgLevels:        "",
+		loggerMu:          new(sync.RWMutex),
+		logger:            nil,
+		Logger:            "zap",
+		LogOutputs:        []string{DefaultLogOutput},
+		LogLevel:          logutil.DefaultLogLevel,
+		EnableGRPCGateway: true,
 	}
 	cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
 	return cfg
-}
-
-func logTLSHandshakeFailure(conn *tls.Conn, err error) {
-	state := conn.ConnectionState()
-	remoteAddr := conn.RemoteAddr().String()
-	serverName := state.ServerName
-	if len(state.PeerCertificates) > 0 {
-		cert := state.PeerCertificates[0]
-		ips, dns := cert.IPAddresses, cert.DNSNames
-		plog.Infof("rejected connection from %q (error %q, ServerName %q, IPAddresses %q, DNSNames %q)", remoteAddr, err.Error(), serverName, ips, dns)
-	} else {
-		plog.Infof("rejected connection from %q (error %q, ServerName %q)", remoteAddr, err.Error(), serverName)
-	}
 }
 
 func ConfigFromFile(path string) (*Config, error) {
@@ -494,6 +516,24 @@ func (cfg *configYAML) configFromFile(path string) error {
 	return cfg.Validate()
 }
 
+func updateCipherSuites(tls *transport.TLSInfo, ss []string) error {
+	if len(tls.CipherSuites) > 0 && len(ss) > 0 {
+		return fmt.Errorf("TLSInfo.CipherSuites is already specified (given %v)", ss)
+	}
+	if len(ss) > 0 {
+		cs := make([]uint16, len(ss))
+		for i, s := range ss {
+			var ok bool
+			cs[i], ok = tlsutil.GetCipherSuite(s)
+			if !ok {
+				return fmt.Errorf("unexpected TLS cipher suite %q", s)
+			}
+		}
+		tls.CipherSuites = cs
+	}
+	return nil
+}
+
 // Validate ensures that '*embed.Config' fields are properly configured.
 func (cfg *Config) Validate() error {
 	if err := cfg.setupLogging(); err != nil {
@@ -532,10 +572,10 @@ func (cfg *Config) Validate() error {
 		return ErrConflictBootstrapFlags
 	}
 
-	if cfg.TickMs <= 0 {
+	if cfg.TickMs == 0 {
 		return fmt.Errorf("--heartbeat-interval must be >0 (set to %dms)", cfg.TickMs)
 	}
-	if cfg.ElectionMs <= 0 {
+	if cfg.ElectionMs == 0 {
 		return fmt.Errorf("--election-timeout must be >0 (set to %dms)", cfg.ElectionMs)
 	}
 	if 5*cfg.TickMs > cfg.ElectionMs {
@@ -575,19 +615,11 @@ func (cfg *Config) PeerURLsMapAndToken(which string) (urlsmap types.URLsMap, tok
 		clusterStrs, cerr := cfg.GetDNSClusterNames()
 		lg := cfg.logger
 		if cerr != nil {
-			if lg != nil {
-				lg.Warn("failed to resolve during SRV discovery", zap.Error(cerr))
-			} else {
-				plog.Errorf("couldn't resolve during SRV discovery (%v)", cerr)
-			}
+			lg.Warn("failed to resolve during SRV discovery", zap.Error(cerr))
 			return nil, "", cerr
 		}
 		for _, s := range clusterStrs {
-			if lg != nil {
-				lg.Info("got bootstrap from DNS for etcd-server", zap.String("node", s))
-			} else {
-				plog.Noticef("got bootstrap from DNS for etcd-server at %s", s)
-			}
+			lg.Info("got bootstrap from DNS for etcd-server", zap.String("node", s))
 		}
 		clusterStr := strings.Join(clusterStrs, ",")
 		if strings.Contains(clusterStr, "https://") && cfg.PeerTLSInfo.TrustedCAFile == "" {
@@ -628,35 +660,31 @@ func (cfg *Config) GetDNSClusterNames() ([]string, error) {
 	if cerr != nil {
 		clusterStrs = make([]string, 0)
 	}
-	if lg != nil {
-		lg.Info(
-			"get cluster for etcd-server-ssl SRV",
-			zap.String("service-scheme", "https"),
-			zap.String("service-name", "etcd-server-ssl"+serviceNameSuffix),
-			zap.String("server-name", cfg.Name),
-			zap.String("discovery-srv", cfg.DNSCluster),
-			zap.Strings("advertise-peer-urls", cfg.getAPURLs()),
-			zap.Strings("found-cluster", clusterStrs),
-			zap.Error(cerr),
-		)
-	}
+	lg.Info(
+		"get cluster for etcd-server-ssl SRV",
+		zap.String("service-scheme", "https"),
+		zap.String("service-name", "etcd-server-ssl"+serviceNameSuffix),
+		zap.String("server-name", cfg.Name),
+		zap.String("discovery-srv", cfg.DNSCluster),
+		zap.Strings("advertise-peer-urls", cfg.getAPURLs()),
+		zap.Strings("found-cluster", clusterStrs),
+		zap.Error(cerr),
+	)
 
 	defaultHTTPClusterStrs, httpCerr := srv.GetCluster("http", "etcd-server"+serviceNameSuffix, cfg.Name, cfg.DNSCluster, cfg.APUrls)
 	if httpCerr != nil {
 		clusterStrs = append(clusterStrs, defaultHTTPClusterStrs...)
 	}
-	if lg != nil {
-		lg.Info(
-			"get cluster for etcd-server SRV",
-			zap.String("service-scheme", "http"),
-			zap.String("service-name", "etcd-server"+serviceNameSuffix),
-			zap.String("server-name", cfg.Name),
-			zap.String("discovery-srv", cfg.DNSCluster),
-			zap.Strings("advertise-peer-urls", cfg.getAPURLs()),
-			zap.Strings("found-cluster", clusterStrs),
-			zap.Error(httpCerr),
-		)
-	}
+	lg.Info(
+		"get cluster for etcd-server SRV",
+		zap.String("service-scheme", "http"),
+		zap.String("service-name", "etcd-server"+serviceNameSuffix),
+		zap.String("server-name", cfg.Name),
+		zap.String("discovery-srv", cfg.DNSCluster),
+		zap.Strings("advertise-peer-urls", cfg.getAPURLs()),
+		zap.Strings("found-cluster", clusterStrs),
+		zap.Error(httpCerr),
+	)
 
 	return clusterStrs, cerr
 }
@@ -687,39 +715,41 @@ func (cfg Config) defaultClientHost() bool {
 }
 
 func (cfg *Config) ClientSelfCert() (err error) {
-	if cfg.ClientAutoTLS && cfg.ClientTLSInfo.Empty() {
-		chosts := make([]string, len(cfg.LCUrls))
-		for i, u := range cfg.LCUrls {
-			chosts[i] = u.Host
-		}
-		cfg.ClientTLSInfo, err = transport.SelfCert(cfg.logger, filepath.Join(cfg.Dir, "fixtures", "client"), chosts)
-		return err
-	} else if cfg.ClientAutoTLS {
-		if cfg.logger != nil {
-			cfg.logger.Warn("ignoring client auto TLS since certs given")
-		} else {
-			plog.Warningf("ignoring client auto TLS since certs given")
-		}
+	if !cfg.ClientAutoTLS {
+		return nil
 	}
-	return nil
+	if !cfg.ClientTLSInfo.Empty() {
+		cfg.logger.Warn("ignoring client auto TLS since certs given")
+		return nil
+	}
+	chosts := make([]string, len(cfg.LCUrls))
+	for i, u := range cfg.LCUrls {
+		chosts[i] = u.Host
+	}
+	cfg.ClientTLSInfo, err = transport.SelfCert(cfg.logger, filepath.Join(cfg.Dir, "fixtures", "client"), chosts)
+	if err != nil {
+		return err
+	}
+	return updateCipherSuites(&cfg.ClientTLSInfo, cfg.CipherSuites)
 }
 
 func (cfg *Config) PeerSelfCert() (err error) {
-	if cfg.PeerAutoTLS && cfg.PeerTLSInfo.Empty() {
-		phosts := make([]string, len(cfg.LPUrls))
-		for i, u := range cfg.LPUrls {
-			phosts[i] = u.Host
-		}
-		cfg.PeerTLSInfo, err = transport.SelfCert(cfg.logger, filepath.Join(cfg.Dir, "fixtures", "peer"), phosts)
-		return err
-	} else if cfg.PeerAutoTLS {
-		if cfg.logger != nil {
-			cfg.logger.Warn("ignoring peer auto TLS since certs given")
-		} else {
-			plog.Warningf("ignoring peer auto TLS since certs given")
-		}
+	if !cfg.PeerAutoTLS {
+		return nil
 	}
-	return nil
+	if !cfg.PeerTLSInfo.Empty() {
+		cfg.logger.Warn("ignoring peer auto TLS since certs given")
+		return nil
+	}
+	phosts := make([]string, len(cfg.LPUrls))
+	for i, u := range cfg.LPUrls {
+		phosts[i] = u.Host
+	}
+	cfg.PeerTLSInfo, err = transport.SelfCert(cfg.logger, filepath.Join(cfg.Dir, "fixtures", "peer"), phosts)
+	if err != nil {
+		return err
+	}
+	return updateCipherSuites(&cfg.PeerTLSInfo, cfg.CipherSuites)
 }
 
 // UpdateDefaultClusterFromName updates cluster advertise URLs with, if available, default host,
@@ -835,4 +865,12 @@ func (cfg *Config) getMetricsURLs() (ss []string) {
 		ss[i] = cfg.ListenMetricsUrls[i].String()
 	}
 	return ss
+}
+
+func parseBackendFreelistType(freelistType string) bolt.FreelistType {
+	if freelistType == freelistArrayType {
+		return bolt.FreelistArrayType
+	}
+
+	return bolt.FreelistMapType
 }

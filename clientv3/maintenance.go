@@ -16,10 +16,11 @@ package clientv3
 
 import (
 	"context"
+	"fmt"
 	"io"
 
-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
-
+	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 )
 
@@ -67,6 +68,7 @@ type Maintenance interface {
 }
 
 type maintenance struct {
+	lg       *zap.Logger
 	dial     func(endpoint string) (pb.MaintenanceClient, func(), error)
 	remote   pb.MaintenanceClient
 	callOpts []grpc.CallOption
@@ -74,12 +76,25 @@ type maintenance struct {
 
 func NewMaintenance(c *Client) Maintenance {
 	api := &maintenance{
+		lg: c.lg,
 		dial: func(endpoint string) (pb.MaintenanceClient, func(), error) {
-			conn, err := c.dial(endpoint)
+			conn, err := c.Dial(endpoint)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, fmt.Errorf("failed to dial endpoint %s with maintenance client: %v", endpoint, err)
 			}
-			cancel := func() { conn.Close() }
+
+			//get token with established connection
+			dctx := c.ctx
+			cancel := func() {}
+			if c.cfg.DialTimeout > 0 {
+				dctx, cancel = context.WithTimeout(c.ctx, c.cfg.DialTimeout)
+			}
+			err = c.getToken(dctx)
+			cancel()
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to getToken from endpoint %s with maintenance client: %v", endpoint, err)
+			}
+			cancel = func() { conn.Close() }
 			return RetryMaintenanceClient(c, conn), cancel, nil
 		},
 		remote: RetryMaintenanceClient(c, c.conn),
@@ -92,6 +107,7 @@ func NewMaintenance(c *Client) Maintenance {
 
 func NewMaintenanceFromMaintenanceClient(remote pb.MaintenanceClient, c *Client) Maintenance {
 	api := &maintenance{
+		lg: c.lg,
 		dial: func(string) (pb.MaintenanceClient, func(), error) {
 			return remote, func() {}, nil
 		},
@@ -175,6 +191,7 @@ func (m *maintenance) Status(ctx context.Context, endpoint string) (*StatusRespo
 func (m *maintenance) HashKV(ctx context.Context, endpoint string, rev int64) (*HashKVResponse, error) {
 	remote, cancel, err := m.dial(endpoint)
 	if err != nil {
+
 		return nil, toErr(ctx, err)
 	}
 	defer cancel()
@@ -186,28 +203,37 @@ func (m *maintenance) HashKV(ctx context.Context, endpoint string, rev int64) (*
 }
 
 func (m *maintenance) Snapshot(ctx context.Context) (io.ReadCloser, error) {
-	ss, err := m.remote.Snapshot(ctx, &pb.SnapshotRequest{}, m.callOpts...)
+	ss, err := m.remote.Snapshot(ctx, &pb.SnapshotRequest{}, append(m.callOpts, withMax(defaultStreamMaxRetries))...)
 	if err != nil {
 		return nil, toErr(ctx, err)
 	}
 
+	m.lg.Info("opened snapshot stream; downloading")
 	pr, pw := io.Pipe()
 	go func() {
 		for {
 			resp, err := ss.Recv()
 			if err != nil {
+				switch err {
+				case io.EOF:
+					m.lg.Info("completed snapshot read; closing")
+				default:
+					m.lg.Warn("failed to receive from snapshot stream; closing", zap.Error(err))
+				}
 				pw.CloseWithError(err)
 				return
 			}
-			if resp == nil && err == nil {
-				break
-			}
+
+			// can "resp == nil && err == nil"
+			// before we receive snapshot SHA digest?
+			// No, server sends EOF with an empty response
+			// after it sends SHA digest at the end
+
 			if _, werr := pw.Write(resp.Blob); werr != nil {
 				pw.CloseWithError(werr)
 				return
 			}
 		}
-		pw.Close()
 	}()
 	return &snapshotReadCloser{ctx: ctx, ReadCloser: pr}, nil
 }

@@ -17,10 +17,11 @@ package e2e
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"strings"
 	"testing"
 
-	"github.com/coreos/etcd/pkg/testutil"
+	"go.etcd.io/etcd/pkg/v3/testutil"
 )
 
 func TestV2CurlNoTLS(t *testing.T)      { testCurlPutGet(t, &configNoTLS) }
@@ -36,7 +37,8 @@ func testCurlPutGet(t *testing.T, cfg *etcdProcessClusterConfig) {
 	// stale reads that will break the test
 	cfg = configStandalone(*cfg)
 
-	epc, err := newEtcdProcessCluster(cfg)
+	cfg.enableV2 = true
+	epc, err := newEtcdProcessCluster(t, cfg)
 	if err != nil {
 		t.Fatalf("could not start etcd process cluster (%v)", err)
 	}
@@ -64,9 +66,13 @@ func testCurlPutGet(t *testing.T, cfg *etcdProcessClusterConfig) {
 }
 
 func TestV2CurlIssue5182(t *testing.T) {
+	os.Setenv("ETCDCTL_API", "2")
+	defer os.Unsetenv("ETCDCTL_API")
 	defer testutil.AfterTest(t)
 
-	epc := setupEtcdctlTest(t, &configNoTLS, false)
+	copied := configNoTLS
+	copied.enableV2 = true
+	epc := setupEtcdctlTest(t, &copied, false)
 	defer func() {
 		if err := epc.Close(); err != nil {
 			t.Fatalf("error closing etcd processes (%v)", err)
@@ -127,6 +133,8 @@ type cURLReq struct {
 	header   string
 
 	metricsURLScheme string
+
+	ciphers string
 }
 
 // cURLPrefixArgs builds the beginning of a curl command for a given key
@@ -144,7 +152,11 @@ func cURLPrefixArgs(clus *etcdProcessCluster, method string, req cURLReq) []stri
 			cmdArgs = append(cmdArgs, "--cacert", caPath, "--cert", certPath, "--key", privateKeyPath)
 			acurl = toTLS(clus.procs[rand.Intn(clus.cfg.clusterSize)].Config().acurl)
 		} else if clus.cfg.clientTLS == clientTLS {
-			cmdArgs = append(cmdArgs, "--cacert", caPath, "--cert", certPath, "--key", privateKeyPath)
+			if !clus.cfg.noCN {
+				cmdArgs = append(cmdArgs, "--cacert", caPath, "--cert", certPath, "--key", privateKeyPath)
+			} else {
+				cmdArgs = append(cmdArgs, "--cacert", caPath, "--cert", certPath3, "--key", privateKeyPath3)
+			}
 		}
 	}
 	if req.metricsURLScheme != "" {
@@ -163,6 +175,10 @@ func cURLPrefixArgs(clus *etcdProcessCluster, method string, req cURLReq) []stri
 
 	if req.header != "" {
 		cmdArgs = append(cmdArgs, "-H", req.header)
+	}
+
+	if req.ciphers != "" {
+		cmdArgs = append(cmdArgs, "--ciphers", req.ciphers)
 	}
 
 	switch method {

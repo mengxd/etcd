@@ -19,15 +19,15 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/coreos/etcd/auth/authpb"
-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
-
+	"go.etcd.io/etcd/api/v3/authpb"
+	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	"google.golang.org/grpc"
 )
 
 type (
 	AuthEnableResponse               pb.AuthEnableResponse
 	AuthDisableResponse              pb.AuthDisableResponse
+	AuthStatusResponse               pb.AuthStatusResponse
 	AuthenticateResponse             pb.AuthenticateResponse
 	AuthUserAddResponse              pb.AuthUserAddResponse
 	AuthUserDeleteResponse           pb.AuthUserDeleteResponse
@@ -53,15 +53,26 @@ const (
 	PermReadWrite = authpb.READWRITE
 )
 
+type UserAddOptions authpb.UserAddOptions
+
 type Auth interface {
+	// Authenticate login and get token
+	Authenticate(ctx context.Context, name string, password string) (*AuthenticateResponse, error)
+
 	// AuthEnable enables auth of an etcd cluster.
 	AuthEnable(ctx context.Context) (*AuthEnableResponse, error)
 
 	// AuthDisable disables auth of an etcd cluster.
 	AuthDisable(ctx context.Context) (*AuthDisableResponse, error)
 
+	// AuthStatus returns the status of auth of an etcd cluster.
+	AuthStatus(ctx context.Context) (*AuthStatusResponse, error)
+
 	// UserAdd adds a new user to an etcd cluster.
 	UserAdd(ctx context.Context, name string, password string) (*AuthUserAddResponse, error)
+
+	// UserAddWithOptions adds a new user to an etcd cluster with some options.
+	UserAddWithOptions(ctx context.Context, name string, password string, opt *UserAddOptions) (*AuthUserAddResponse, error)
 
 	// UserDelete deletes a user from an etcd cluster.
 	UserDelete(ctx context.Context, name string) (*AuthUserDeleteResponse, error)
@@ -113,6 +124,19 @@ func NewAuth(c *Client) Auth {
 	return api
 }
 
+func NewAuthFromAuthClient(remote pb.AuthClient, c *Client) Auth {
+	api := &authClient{remote: remote}
+	if c != nil {
+		api.callOpts = c.callOpts
+	}
+	return api
+}
+
+func (auth *authClient) Authenticate(ctx context.Context, name string, password string) (*AuthenticateResponse, error) {
+	resp, err := auth.remote.Authenticate(ctx, &pb.AuthenticateRequest{Name: name, Password: password}, auth.callOpts...)
+	return (*AuthenticateResponse)(resp), toErr(ctx, err)
+}
+
 func (auth *authClient) AuthEnable(ctx context.Context) (*AuthEnableResponse, error) {
 	resp, err := auth.remote.AuthEnable(ctx, &pb.AuthEnableRequest{}, auth.callOpts...)
 	return (*AuthEnableResponse)(resp), toErr(ctx, err)
@@ -123,8 +147,18 @@ func (auth *authClient) AuthDisable(ctx context.Context) (*AuthDisableResponse, 
 	return (*AuthDisableResponse)(resp), toErr(ctx, err)
 }
 
+func (auth *authClient) AuthStatus(ctx context.Context) (*AuthStatusResponse, error) {
+	resp, err := auth.remote.AuthStatus(ctx, &pb.AuthStatusRequest{}, auth.callOpts...)
+	return (*AuthStatusResponse)(resp), toErr(ctx, err)
+}
+
 func (auth *authClient) UserAdd(ctx context.Context, name string, password string) (*AuthUserAddResponse, error) {
-	resp, err := auth.remote.UserAdd(ctx, &pb.AuthUserAddRequest{Name: name, Password: password}, auth.callOpts...)
+	resp, err := auth.remote.UserAdd(ctx, &pb.AuthUserAddRequest{Name: name, Password: password, Options: &authpb.UserAddOptions{NoPassword: false}}, auth.callOpts...)
+	return (*AuthUserAddResponse)(resp), toErr(ctx, err)
+}
+
+func (auth *authClient) UserAddWithOptions(ctx context.Context, name string, password string, options *UserAddOptions) (*AuthUserAddResponse, error) {
+	resp, err := auth.remote.UserAdd(ctx, &pb.AuthUserAddRequest{Name: name, Password: password, Options: (*authpb.UserAddOptions)(options)}, auth.callOpts...)
 	return (*AuthUserAddResponse)(resp), toErr(ctx, err)
 }
 
@@ -199,35 +233,4 @@ func StrToPermissionType(s string) (PermissionType, error) {
 		return PermissionType(val), nil
 	}
 	return PermissionType(-1), fmt.Errorf("invalid permission type: %s", s)
-}
-
-type authenticator struct {
-	conn     *grpc.ClientConn // conn in-use
-	remote   pb.AuthClient
-	callOpts []grpc.CallOption
-}
-
-func (auth *authenticator) authenticate(ctx context.Context, name string, password string) (*AuthenticateResponse, error) {
-	resp, err := auth.remote.Authenticate(ctx, &pb.AuthenticateRequest{Name: name, Password: password}, auth.callOpts...)
-	return (*AuthenticateResponse)(resp), toErr(ctx, err)
-}
-
-func (auth *authenticator) close() {
-	auth.conn.Close()
-}
-
-func newAuthenticator(endpoint string, opts []grpc.DialOption, c *Client) (*authenticator, error) {
-	conn, err := grpc.Dial(endpoint, opts...)
-	if err != nil {
-		return nil, err
-	}
-
-	api := &authenticator{
-		conn:   conn,
-		remote: pb.NewAuthClient(conn),
-	}
-	if c != nil {
-		api.callOpts = c.callOpts
-	}
-	return api, nil
 }

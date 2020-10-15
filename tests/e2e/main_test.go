@@ -10,7 +10,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/coreos/etcd/pkg/testutil"
+	"go.etcd.io/etcd/pkg/v3/testutil"
 )
 
 var (
@@ -24,6 +24,9 @@ var (
 	certPath2       string
 	privateKeyPath2 string
 
+	certPath3       string
+	privateKeyPath3 string
+
 	crlPath               string
 	revokedCertPath       string
 	revokedPrivateKeyPath string
@@ -34,7 +37,7 @@ func TestMain(m *testing.M) {
 	os.Unsetenv("ETCDCTL_API")
 
 	flag.StringVar(&binDir, "bin-dir", "../../bin", "The directory for store etcd and etcdctl binaries.")
-	flag.StringVar(&certDir, "cert-dir", "../../integration/fixtures", "The directory for store certificate files.")
+	flag.StringVar(&certDir, "cert-dir", "../fixtures", "The directory for store certificate files.")
 	flag.Parse()
 
 	binPath = binDir + "/etcd"
@@ -48,6 +51,9 @@ func TestMain(m *testing.M) {
 
 	certPath2 = certDir + "/server2.crt"
 	privateKeyPath2 = certDir + "/server2.key.insecure"
+
+	certPath3 = certDir + "/server3.crt"
+	privateKeyPath3 = certDir + "/server3.key.insecure"
 
 	v := m.Run()
 	if v == 0 && testutil.CheckLeakedGoroutine() {

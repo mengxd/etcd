@@ -14,7 +14,7 @@
 
 package auth
 
-// CAUTION: This randum number based token mechanism is only for testing purpose.
+// CAUTION: This random number based token mechanism is only for testing purpose.
 // JWT based mechanism will be added in the near future.
 
 import (
@@ -36,8 +36,9 @@ const (
 )
 
 // var for testing purposes
+// TODO: Remove this mutable global state - as it's race-prone.
 var (
-	simpleTokenTTL           = 5 * time.Minute
+	simpleTokenTTLDefault    = 300 * time.Second
 	simpleTokenTTLResolution = 1 * time.Second
 )
 
@@ -47,6 +48,7 @@ type simpleTokenTTLKeeper struct {
 	stopc           chan struct{}
 	deleteTokenFunc func(string)
 	mu              *sync.Mutex
+	simpleTokenTTL  time.Duration
 }
 
 func (tm *simpleTokenTTLKeeper) stop() {
@@ -58,12 +60,12 @@ func (tm *simpleTokenTTLKeeper) stop() {
 }
 
 func (tm *simpleTokenTTLKeeper) addSimpleToken(token string) {
-	tm.tokens[token] = time.Now().Add(simpleTokenTTL)
+	tm.tokens[token] = time.Now().Add(tm.simpleTokenTTL)
 }
 
 func (tm *simpleTokenTTLKeeper) resetSimpleToken(token string) {
 	if _, ok := tm.tokens[token]; ok {
-		tm.tokens[token] = time.Now().Add(simpleTokenTTL)
+		tm.tokens[token] = time.Now().Add(tm.simpleTokenTTL)
 	}
 }
 
@@ -101,6 +103,7 @@ type tokenSimple struct {
 	simpleTokenKeeper *simpleTokenTTLKeeper
 	simpleTokensMu    sync.Mutex
 	simpleTokens      map[string]string // token -> username
+	simpleTokenTTL    time.Duration
 }
 
 func (t *tokenSimple) genTokenPrefix() (string, error) {
@@ -127,15 +130,11 @@ func (t *tokenSimple) assignSimpleTokenToUser(username, token string) {
 
 	_, ok := t.simpleTokens[token]
 	if ok {
-		if t.lg != nil {
-			t.lg.Panic(
-				"failed to assign already-used simple token to a user",
-				zap.String("user-name", username),
-				zap.String("token", token),
-			)
-		} else {
-			plog.Panicf("token %s is alredy used", token)
-		}
+		t.lg.Panic(
+			"failed to assign already-used simple token to a user",
+			zap.String("user-name", username),
+			zap.String("token", token),
+		)
 	}
 
 	t.simpleTokens[token] = username
@@ -157,17 +156,17 @@ func (t *tokenSimple) invalidateUser(username string) {
 }
 
 func (t *tokenSimple) enable() {
+	if t.simpleTokenTTL <= 0 {
+		t.simpleTokenTTL = simpleTokenTTLDefault
+	}
+
 	delf := func(tk string) {
 		if username, ok := t.simpleTokens[tk]; ok {
-			if t.lg != nil {
-				t.lg.Info(
-					"deleted a simple token",
-					zap.String("user-name", username),
-					zap.String("token", tk),
-				)
-			} else {
-				plog.Infof("deleting token %s for user %s", tk, username)
-			}
+			t.lg.Info(
+				"deleted a simple token",
+				zap.String("user-name", username),
+				zap.String("token", tk),
+			)
 			delete(t.simpleTokens, tk)
 		}
 	}
@@ -177,6 +176,7 @@ func (t *tokenSimple) enable() {
 		stopc:           make(chan struct{}),
 		deleteTokenFunc: delf,
 		mu:              &t.simpleTokensMu,
+		simpleTokenTTL:  t.simpleTokenTTL,
 	}
 	go t.simpleTokenKeeper.run()
 }
@@ -220,7 +220,7 @@ func (t *tokenSimple) isValidSimpleToken(ctx context.Context, token string) bool
 	if len(splitted) != 2 {
 		return false
 	}
-	index, err := strconv.Atoi(splitted[1])
+	index, err := strconv.ParseUint(splitted[1], 10, 0)
 	if err != nil {
 		return false
 	}
@@ -234,10 +234,14 @@ func (t *tokenSimple) isValidSimpleToken(ctx context.Context, token string) bool
 	return false
 }
 
-func newTokenProviderSimple(lg *zap.Logger, indexWaiter func(uint64) <-chan struct{}) *tokenSimple {
+func newTokenProviderSimple(lg *zap.Logger, indexWaiter func(uint64) <-chan struct{}, TokenTTL time.Duration) *tokenSimple {
+	if lg == nil {
+		lg = zap.NewNop()
+	}
 	return &tokenSimple{
-		lg:           lg,
-		simpleTokens: make(map[string]string),
-		indexWaiter:  indexWaiter,
+		lg:             lg,
+		simpleTokens:   make(map[string]string),
+		indexWaiter:    indexWaiter,
+		simpleTokenTTL: TokenTTL,
 	}
 }

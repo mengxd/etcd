@@ -17,10 +17,10 @@ package grpcproxy
 import (
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
-	"github.com/coreos/etcd/mvcc"
-	"github.com/coreos/etcd/mvcc/mvccpb"
+	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.etcd.io/etcd/api/v3/mvccpb"
+	"go.etcd.io/etcd/v3/clientv3"
+	"go.etcd.io/etcd/v3/mvcc"
 )
 
 type watchRange struct {
@@ -123,6 +123,7 @@ func (w *watcher) post(wr *pb.WatchResponse) bool {
 	case w.wps.watchCh <- wr:
 	case <-time.After(50 * time.Millisecond):
 		w.wps.cancel()
+		w.wps.lg.Error("failed to put a watch response on the watcher's proxy stream channel,err is timeout")
 		return false
 	}
 	return true

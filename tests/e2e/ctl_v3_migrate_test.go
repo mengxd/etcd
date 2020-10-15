@@ -21,14 +21,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/pkg/testutil"
+	"go.etcd.io/etcd/pkg/v3/testutil"
+	"go.etcd.io/etcd/v3/clientv3"
 )
 
 func TestCtlV3Migrate(t *testing.T) {
 	defer testutil.AfterTest(t)
 
-	epc := setupEtcdctlTest(t, &configNoTLS, false)
+	cfg := configNoTLS
+	cfg.enableV2 = true
+	epc := setupEtcdctlTest(t, &cfg, false)
 	defer func() {
 		if errC := epc.Close(); errC != nil {
 			t.Fatalf("error closing etcd processes (%v)", errC)
@@ -41,6 +43,7 @@ func TestCtlV3Migrate(t *testing.T) {
 		keys[i] = fmt.Sprintf("foo_%d", i)
 		vals[i] = fmt.Sprintf("bar_%d", i)
 	}
+	os.Setenv("ETCDCTL_API", "2")
 	for i := range keys {
 		if err := etcdctlSet(epc, keys[i], vals[i]); err != nil {
 			t.Fatal(err)
@@ -52,8 +55,7 @@ func TestCtlV3Migrate(t *testing.T) {
 		t.Fatalf("error closing etcd processes (%v)", err)
 	}
 
-	os.Setenv("ETCDCTL_API", "3")
-	defer os.Unsetenv("ETCDCTL_API")
+	os.Unsetenv("ETCDCTL_API")
 	cx := ctlCtx{
 		t:           t,
 		cfg:         configNoTLS,
@@ -69,10 +71,6 @@ func TestCtlV3Migrate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// to ensure revision increment is continuous from migrated v2 data
-	if err := ctlV3Put(cx, "test", "value", ""); err != nil {
-		t.Fatal(err)
-	}
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   epc.EndpointsV3(),
 		DialTimeout: 3 * time.Second,
@@ -85,11 +83,22 @@ func TestCtlV3Migrate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	revAfterMigrate := resp.Header.Revision
+	// to ensure revision increment is continuous from migrated v2 data
+	if err := ctlV3Put(cx, "test", "value", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err = cli.Get(context.TODO(), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(resp.Kvs) != 1 {
 		t.Fatalf("len(resp.Kvs) expected 1, got %+v", resp.Kvs)
 	}
-	if resp.Kvs[0].CreateRevision != 7 {
-		t.Fatalf("resp.Kvs[0].CreateRevision expected 7, got %d", resp.Kvs[0].CreateRevision)
+
+	if resp.Kvs[0].CreateRevision != revAfterMigrate+1 {
+		t.Fatalf("expected revision increment is continuous from migrated v2, got %d", resp.Kvs[0].CreateRevision)
 	}
 }
 

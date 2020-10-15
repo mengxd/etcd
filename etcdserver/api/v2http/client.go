@@ -27,17 +27,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coreos/etcd/etcdserver"
-	"github.com/coreos/etcd/etcdserver/api"
-	"github.com/coreos/etcd/etcdserver/api/etcdhttp"
-	"github.com/coreos/etcd/etcdserver/api/v2http/httptypes"
-	"github.com/coreos/etcd/etcdserver/etcdserverpb"
-	"github.com/coreos/etcd/etcdserver/membership"
-	"github.com/coreos/etcd/etcdserver/stats"
-	"github.com/coreos/etcd/etcdserver/v2auth"
-	"github.com/coreos/etcd/etcdserver/v2error"
-	"github.com/coreos/etcd/etcdserver/v2store"
-	"github.com/coreos/etcd/pkg/types"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.etcd.io/etcd/pkg/v3/types"
+	"go.etcd.io/etcd/v3/etcdserver"
+	"go.etcd.io/etcd/v3/etcdserver/api"
+	"go.etcd.io/etcd/v3/etcdserver/api/etcdhttp"
+	"go.etcd.io/etcd/v3/etcdserver/api/membership"
+	"go.etcd.io/etcd/v3/etcdserver/api/v2auth"
+	"go.etcd.io/etcd/v3/etcdserver/api/v2error"
+	"go.etcd.io/etcd/v3/etcdserver/api/v2http/httptypes"
+	stats "go.etcd.io/etcd/v3/etcdserver/api/v2stats"
+	"go.etcd.io/etcd/v3/etcdserver/api/v2store"
 
 	"github.com/jonboulle/clockwork"
 	"go.uber.org/zap"
@@ -53,8 +53,12 @@ const (
 
 // NewClientHandler generates a muxed http.Handler with the given parameters to serve etcd client requests.
 func NewClientHandler(lg *zap.Logger, server etcdserver.ServerPeer, timeout time.Duration) http.Handler {
+	if lg == nil {
+		lg = zap.NewNop()
+	}
 	mux := http.NewServeMux()
-	etcdhttp.HandleBasic(mux, server)
+	etcdhttp.HandleBasic(lg, mux, server)
+	etcdhttp.HandleMetricsHealth(lg, mux, server)
 	handleV2(lg, mux, server, timeout)
 	return requestLogger(lg, mux)
 }
@@ -76,12 +80,12 @@ func handleV2(lg *zap.Logger, mux *http.ServeMux, server etcdserver.ServerV2, ti
 	}
 
 	mh := &membersHandler{
-		lg:      lg,
-		sec:     sec,
-		server:  server,
-		cluster: server.Cluster(),
-		timeout: timeout,
-		clock:   clockwork.NewRealClock(),
+		lg:                    lg,
+		sec:                   sec,
+		server:                server,
+		cluster:               server.Cluster(),
+		timeout:               timeout,
+		clock:                 clockwork.NewRealClock(),
 		clientCertAuthEnabled: server.ClientCertAuthEnabled(),
 	}
 
@@ -149,19 +153,15 @@ func (h *keysHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case resp.Event != nil:
 		if err := writeKeyEvent(w, resp, noValueOnSuccess); err != nil {
 			// Should never be reached
-			if h.lg != nil {
-				h.lg.Warn("failed to write key event", zap.Error(err))
-			} else {
-				plog.Errorf("error writing event (%v)", err)
-			}
+			h.lg.Warn("failed to write key event", zap.Error(err))
 		}
-		reportRequestCompleted(rr, resp, startTime)
+		reportRequestCompleted(rr, startTime)
 	case resp.Watcher != nil:
 		ctx, cancel := context.WithTimeout(context.Background(), defaultWatchTimeout)
 		defer cancel()
 		handleKeyWatch(ctx, h.lg, w, resp, rr.Stream)
 	default:
-		writeKeyError(h.lg, w, errors.New("received response with no Event/Watcher!"))
+		writeKeyError(h.lg, w, errors.New("received response with no Event/Watcher"))
 	}
 }
 
@@ -207,11 +207,7 @@ func (h *membersHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			mc := newMemberCollection(h.cluster.Members())
 			w.Header().Set("Content-Type", "application/json")
 			if err := json.NewEncoder(w).Encode(mc); err != nil {
-				if h.lg != nil {
-					h.lg.Warn("failed to encode members response", zap.Error(err))
-				} else {
-					plog.Warningf("failed to encode members response (%v)", err)
-				}
+				h.lg.Warn("failed to encode members response", zap.Error(err))
 			}
 		case "leader":
 			id := h.server.Leader()
@@ -222,11 +218,7 @@ func (h *membersHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			m := newMember(h.cluster.Member(id))
 			w.Header().Set("Content-Type", "application/json")
 			if err := json.NewEncoder(w).Encode(m); err != nil {
-				if h.lg != nil {
-					h.lg.Warn("failed to encode members response", zap.Error(err))
-				} else {
-					plog.Warningf("failed to encode members response (%v)", err)
-				}
+				h.lg.Warn("failed to encode members response", zap.Error(err))
 			}
 		default:
 			writeError(h.lg, w, r, httptypes.NewHTTPError(http.StatusNotFound, "Not found"))
@@ -245,15 +237,11 @@ func (h *membersHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(h.lg, w, r, httptypes.NewHTTPError(http.StatusConflict, err.Error()))
 			return
 		case err != nil:
-			if h.lg != nil {
-				h.lg.Warn(
-					"failed to add a member",
-					zap.String("member-id", m.ID.String()),
-					zap.Error(err),
-				)
-			} else {
-				plog.Errorf("error adding member %s (%v)", m.ID, err)
-			}
+			h.lg.Warn(
+				"failed to add a member",
+				zap.String("member-id", m.ID.String()),
+				zap.Error(err),
+			)
 			writeError(h.lg, w, r, err)
 			return
 		}
@@ -261,11 +249,7 @@ func (h *membersHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		if err := json.NewEncoder(w).Encode(res); err != nil {
-			if h.lg != nil {
-				h.lg.Warn("failed to encode members response", zap.Error(err))
-			} else {
-				plog.Warningf("failed to encode members response (%v)", err)
-			}
+			h.lg.Warn("failed to encode members response", zap.Error(err))
 		}
 
 	case "DELETE":
@@ -280,15 +264,11 @@ func (h *membersHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case err == membership.ErrIDNotFound:
 			writeError(h.lg, w, r, httptypes.NewHTTPError(http.StatusNotFound, fmt.Sprintf("No such member: %s", id)))
 		case err != nil:
-			if h.lg != nil {
-				h.lg.Warn(
-					"failed to remove a member",
-					zap.String("member-id", id.String()),
-					zap.Error(err),
-				)
-			} else {
-				plog.Errorf("error removing member %s (%v)", id, err)
-			}
+			h.lg.Warn(
+				"failed to remove a member",
+				zap.String("member-id", id.String()),
+				zap.Error(err),
+			)
 			writeError(h.lg, w, r, err)
 		default:
 			w.WriteHeader(http.StatusNoContent)
@@ -314,15 +294,11 @@ func (h *membersHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case err == membership.ErrIDNotFound:
 			writeError(h.lg, w, r, httptypes.NewHTTPError(http.StatusNotFound, fmt.Sprintf("No such member: %s", id)))
 		case err != nil:
-			if h.lg != nil {
-				h.lg.Warn(
-					"failed to update a member",
-					zap.String("member-id", m.ID.String()),
-					zap.Error(err),
-				)
-			} else {
-				plog.Errorf("error updating member %s (%v)", m.ID, err)
-			}
+			h.lg.Warn(
+				"failed to update a member",
+				zap.String("member-id", m.ID.String()),
+				zap.Error(err),
+			)
 			writeError(h.lg, w, r, err)
 		default:
 			w.WriteHeader(http.StatusNoContent)
@@ -556,7 +532,7 @@ func parseKeyRequest(r *http.Request, clock clockwork.Clock) (etcdserverpb.Reque
 func writeKeyEvent(w http.ResponseWriter, resp etcdserver.Response, noValueOnSuccess bool) error {
 	ev := resp.Event
 	if ev == nil {
-		return errors.New("cannot write empty Event!")
+		return errors.New("cannot write empty Event")
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Etcd-Index", fmt.Sprint(ev.EtcdIndex))
@@ -599,8 +575,6 @@ func writeKeyError(lg *zap.Logger, w http.ResponseWriter, err error) {
 					"v2 response error",
 					zap.String("internal-server-error", err.Error()),
 				)
-			} else {
-				mlog.MergeError(err)
 			}
 		default:
 			if lg != nil {
@@ -608,8 +582,6 @@ func writeKeyError(lg *zap.Logger, w http.ResponseWriter, err error) {
 					"unexpected v2 response error",
 					zap.String("internal-server-error", err.Error()),
 				)
-			} else {
-				mlog.MergeErrorf("got unexpected response error (%v)", err)
 			}
 		}
 		ee := v2error.NewError(v2error.EcodeRaftInternal, err.Error(), 0)
@@ -653,11 +625,7 @@ func handleKeyWatch(ctx context.Context, lg *zap.Logger, w http.ResponseWriter, 
 			ev = trimEventPrefix(ev, etcdserver.StoreKeysPrefix)
 			if err := json.NewEncoder(w).Encode(ev); err != nil {
 				// Should never be reached
-				if lg != nil {
-					lg.Warn("failed to encode event", zap.Error(err))
-				} else {
-					plog.Warningf("error writing event (%v)", err)
-				}
+				lg.Warn("failed to encode event", zap.Error(err))
 				return
 			}
 			if !stream {

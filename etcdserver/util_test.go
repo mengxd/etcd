@@ -21,11 +21,11 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/coreos/etcd/etcdserver/membership"
-	"github.com/coreos/etcd/pkg/types"
-	"github.com/coreos/etcd/raft/raftpb"
-	"github.com/coreos/etcd/rafthttp"
-	"github.com/coreos/etcd/raftsnap"
+	"go.etcd.io/etcd/pkg/v3/types"
+	"go.etcd.io/etcd/v3/etcdserver/api/membership"
+	"go.etcd.io/etcd/v3/etcdserver/api/rafthttp"
+	"go.etcd.io/etcd/v3/etcdserver/api/snap"
+	"go.etcd.io/etcd/v3/raft/raftpb"
 )
 
 func TestLongestConnected(t *testing.T) {
@@ -78,7 +78,7 @@ func newNopTransporterWithActiveTime(memberIDs []types.ID) rafthttp.Transporter 
 func (s *nopTransporterWithActiveTime) Start() error                        { return nil }
 func (s *nopTransporterWithActiveTime) Handler() http.Handler               { return nil }
 func (s *nopTransporterWithActiveTime) Send(m []raftpb.Message)             {}
-func (s *nopTransporterWithActiveTime) SendSnapshot(m raftsnap.Message)     {}
+func (s *nopTransporterWithActiveTime) SendSnapshot(m snap.Message)         {}
 func (s *nopTransporterWithActiveTime) AddRemote(id types.ID, us []string)  {}
 func (s *nopTransporterWithActiveTime) AddPeer(id types.ID, us []string)    {}
 func (s *nopTransporterWithActiveTime) RemovePeer(id types.ID)              {}
@@ -90,3 +90,23 @@ func (s *nopTransporterWithActiveTime) Stop()                               {}
 func (s *nopTransporterWithActiveTime) Pause()                              {}
 func (s *nopTransporterWithActiveTime) Resume()                             {}
 func (s *nopTransporterWithActiveTime) reset(am map[types.ID]time.Time)     { s.activeMap = am }
+
+func TestPanicAlternativeStringer(t *testing.T) {
+	p := panicAlternativeStringer{alternative: func() string { return "alternative" }}
+
+	p.stringer = testStringerFunc(func() string { panic("here") })
+	if s := p.String(); s != "alternative" {
+		t.Fatalf("expected 'alternative', got %q", s)
+	}
+
+	p.stringer = testStringerFunc(func() string { return "test" })
+	if s := p.String(); s != "test" {
+		t.Fatalf("expected 'test', got %q", s)
+	}
+}
+
+type testStringerFunc func() string
+
+func (s testStringerFunc) String() string {
+	return s()
+}

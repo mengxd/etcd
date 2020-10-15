@@ -19,35 +19,35 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
 
+	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.etcd.io/etcd/pkg/v3/fileutil"
+	"go.etcd.io/etcd/pkg/v3/idutil"
+	"go.etcd.io/etcd/pkg/v3/pbutil"
+	"go.etcd.io/etcd/pkg/v3/testutil"
+	"go.etcd.io/etcd/pkg/v3/types"
+	"go.etcd.io/etcd/pkg/v3/wait"
+	"go.etcd.io/etcd/v3/etcdserver/api/membership"
+	"go.etcd.io/etcd/v3/etcdserver/api/rafthttp"
+	"go.etcd.io/etcd/v3/etcdserver/api/snap"
+	"go.etcd.io/etcd/v3/etcdserver/api/v2store"
+	"go.etcd.io/etcd/v3/etcdserver/cindex"
+	"go.etcd.io/etcd/v3/lease"
+	"go.etcd.io/etcd/v3/mvcc"
+	"go.etcd.io/etcd/v3/mvcc/backend"
+	"go.etcd.io/etcd/v3/raft"
+	"go.etcd.io/etcd/v3/raft/raftpb"
+	"go.etcd.io/etcd/v3/server/mock/mockstorage"
+	"go.etcd.io/etcd/v3/server/mock/mockstore"
+	"go.etcd.io/etcd/v3/server/mock/mockwait"
 	"go.uber.org/zap"
-
-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
-	"github.com/coreos/etcd/etcdserver/membership"
-	"github.com/coreos/etcd/etcdserver/v2store"
-	"github.com/coreos/etcd/lease"
-	"github.com/coreos/etcd/mvcc"
-	"github.com/coreos/etcd/mvcc/backend"
-	"github.com/coreos/etcd/pkg/fileutil"
-	"github.com/coreos/etcd/pkg/idutil"
-	"github.com/coreos/etcd/pkg/mock/mockstorage"
-	"github.com/coreos/etcd/pkg/mock/mockstore"
-	"github.com/coreos/etcd/pkg/mock/mockwait"
-	"github.com/coreos/etcd/pkg/pbutil"
-	"github.com/coreos/etcd/pkg/testutil"
-	"github.com/coreos/etcd/pkg/types"
-	"github.com/coreos/etcd/pkg/wait"
-	"github.com/coreos/etcd/raft"
-	"github.com/coreos/etcd/raft/raftpb"
-	"github.com/coreos/etcd/rafthttp"
-	"github.com/coreos/etcd/raftsnap"
 )
 
 // TestDoLocalAction tests requests which do not need to go through raft to be applied,
@@ -182,16 +182,17 @@ func TestApplyRepeat(t *testing.T) {
 		Node:        n,
 		raftStorage: raft.NewMemoryStorage(),
 		storage:     mockstorage.NewStorageRecorder(""),
-		transport:   rafthttp.NewNopTransporter(),
+		transport:   newNopTransporter(),
 	})
 	s := &EtcdServer{
-		lgMu:       new(sync.RWMutex),
-		lg:         zap.NewExample(),
-		r:          *r,
-		v2store:    st,
-		cluster:    cl,
-		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
-		SyncTicker: &time.Ticker{},
+		lgMu:         new(sync.RWMutex),
+		lg:           zap.NewExample(),
+		r:            *r,
+		v2store:      st,
+		cluster:      cl,
+		reqIDGen:     idutil.NewGenerator(0, time.Time{}),
+		SyncTicker:   &time.Ticker{},
+		consistIndex: cindex.NewFakeConsistentIndex(0),
 	}
 	s.applyV2 = &applierV2store{store: s.v2store, cluster: s.cluster}
 	s.start()
@@ -507,35 +508,57 @@ func TestApplyConfChangeError(t *testing.T) {
 	}
 	cl.RemoveMember(4)
 
+	attr := membership.RaftAttributes{PeerURLs: []string{fmt.Sprintf("http://127.0.0.1:%d", 1)}}
+	ctx, err := json.Marshal(&membership.Member{ID: types.ID(1), RaftAttributes: attr})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	attr = membership.RaftAttributes{PeerURLs: []string{fmt.Sprintf("http://127.0.0.1:%d", 4)}}
+	ctx4, err := json.Marshal(&membership.Member{ID: types.ID(1), RaftAttributes: attr})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	attr = membership.RaftAttributes{PeerURLs: []string{fmt.Sprintf("http://127.0.0.1:%d", 5)}}
+	ctx5, err := json.Marshal(&membership.Member{ID: types.ID(1), RaftAttributes: attr})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	tests := []struct {
 		cc   raftpb.ConfChange
 		werr error
 	}{
 		{
 			raftpb.ConfChange{
-				Type:   raftpb.ConfChangeAddNode,
-				NodeID: 4,
+				Type:    raftpb.ConfChangeAddNode,
+				NodeID:  4,
+				Context: ctx4,
 			},
 			membership.ErrIDRemoved,
 		},
 		{
 			raftpb.ConfChange{
-				Type:   raftpb.ConfChangeUpdateNode,
-				NodeID: 4,
+				Type:    raftpb.ConfChangeUpdateNode,
+				NodeID:  4,
+				Context: ctx4,
 			},
 			membership.ErrIDRemoved,
 		},
 		{
 			raftpb.ConfChange{
-				Type:   raftpb.ConfChangeAddNode,
-				NodeID: 1,
+				Type:    raftpb.ConfChangeAddNode,
+				NodeID:  1,
+				Context: ctx,
 			},
 			membership.ErrIDExists,
 		},
 		{
 			raftpb.ConfChange{
-				Type:   raftpb.ConfChangeRemoveNode,
-				NodeID: 5,
+				Type:    raftpb.ConfChangeRemoveNode,
+				NodeID:  5,
+				Context: ctx5,
 			},
 			membership.ErrIDNotFound,
 		},
@@ -552,7 +575,7 @@ func TestApplyConfChangeError(t *testing.T) {
 		if err != tt.werr {
 			t.Errorf("#%d: applyConfChange error = %v, want %v", i, err, tt.werr)
 		}
-		cc := raftpb.ConfChange{Type: tt.cc.Type, NodeID: raft.None}
+		cc := raftpb.ConfChange{Type: tt.cc.Type, NodeID: raft.None, Context: tt.cc.Context}
 		w := []testutil.Action{
 			{
 				Name:   "ApplyConfChange",
@@ -574,7 +597,7 @@ func TestApplyConfChangeShouldStop(t *testing.T) {
 	r := newRaftNode(raftNodeConfig{
 		lg:        zap.NewExample(),
 		Node:      newNodeNop(),
-		transport: rafthttp.NewNopTransporter(),
+		transport: newNopTransporter(),
 	})
 	srv := &EtcdServer{
 		lgMu:    new(sync.RWMutex),
@@ -616,15 +639,16 @@ func TestApplyConfigChangeUpdatesConsistIndex(t *testing.T) {
 	r := newRaftNode(raftNodeConfig{
 		lg:        zap.NewExample(),
 		Node:      newNodeNop(),
-		transport: rafthttp.NewNopTransporter(),
+		transport: newNopTransporter(),
 	})
 	srv := &EtcdServer{
-		lgMu:    new(sync.RWMutex),
-		lg:      zap.NewExample(),
-		id:      1,
-		r:       *r,
-		cluster: cl,
-		w:       wait.New(),
+		lgMu:         new(sync.RWMutex),
+		lg:           zap.NewExample(),
+		id:           1,
+		r:            *r,
+		cluster:      cl,
+		w:            wait.New(),
+		consistIndex: cindex.NewFakeConsistentIndex(0),
 	}
 
 	// create EntryConfChange entry
@@ -664,15 +688,16 @@ func TestApplyMultiConfChangeShouldStop(t *testing.T) {
 	r := newRaftNode(raftNodeConfig{
 		lg:        zap.NewExample(),
 		Node:      newNodeNop(),
-		transport: rafthttp.NewNopTransporter(),
+		transport: newNopTransporter(),
 	})
 	srv := &EtcdServer{
-		lgMu:    new(sync.RWMutex),
-		lg:      zap.NewExample(),
-		id:      2,
-		r:       *r,
-		cluster: cl,
-		w:       wait.New(),
+		lgMu:         new(sync.RWMutex),
+		lg:           zap.NewExample(),
+		id:           2,
+		r:            *r,
+		cluster:      cl,
+		w:            wait.New(),
+		consistIndex: cindex.NewFakeConsistentIndex(0),
 	}
 	ents := []raftpb.Entry{}
 	for i := 1; i <= 4; i++ {
@@ -708,16 +733,17 @@ func TestDoProposal(t *testing.T) {
 			Node:        newNodeCommitter(),
 			storage:     mockstorage.NewStorageRecorder(""),
 			raftStorage: raft.NewMemoryStorage(),
-			transport:   rafthttp.NewNopTransporter(),
+			transport:   newNopTransporter(),
 		})
 		srv := &EtcdServer{
-			lgMu:       new(sync.RWMutex),
-			lg:         zap.NewExample(),
-			Cfg:        ServerConfig{Logger: zap.NewExample(), TickMs: 1},
-			r:          *r,
-			v2store:    st,
-			reqIDGen:   idutil.NewGenerator(0, time.Time{}),
-			SyncTicker: &time.Ticker{},
+			lgMu:         new(sync.RWMutex),
+			lg:           zap.NewExample(),
+			Cfg:          ServerConfig{Logger: zap.NewExample(), TickMs: 1, SnapshotCatchUpEntries: DefaultSnapshotCatchUpEntries},
+			r:            *r,
+			v2store:      st,
+			reqIDGen:     idutil.NewGenerator(0, time.Time{}),
+			SyncTicker:   &time.Ticker{},
+			consistIndex: cindex.NewFakeConsistentIndex(0),
 		}
 		srv.applyV2 = &applierV2store{store: srv.v2store, cluster: srv.cluster}
 		srv.start()
@@ -744,7 +770,7 @@ func TestDoProposalCancelled(t *testing.T) {
 	srv := &EtcdServer{
 		lgMu:     new(sync.RWMutex),
 		lg:       zap.NewExample(),
-		Cfg:      ServerConfig{Logger: zap.NewExample(), TickMs: 1},
+		Cfg:      ServerConfig{Logger: zap.NewExample(), TickMs: 1, SnapshotCatchUpEntries: DefaultSnapshotCatchUpEntries},
 		r:        *newRaftNode(raftNodeConfig{Node: newNodeNop()}),
 		w:        wt,
 		reqIDGen: idutil.NewGenerator(0, time.Time{}),
@@ -768,7 +794,7 @@ func TestDoProposalTimeout(t *testing.T) {
 	srv := &EtcdServer{
 		lgMu:     new(sync.RWMutex),
 		lg:       zap.NewExample(),
-		Cfg:      ServerConfig{Logger: zap.NewExample(), TickMs: 1},
+		Cfg:      ServerConfig{Logger: zap.NewExample(), TickMs: 1, SnapshotCatchUpEntries: DefaultSnapshotCatchUpEntries},
 		r:        *newRaftNode(raftNodeConfig{Node: newNodeNop()}),
 		w:        mockwait.NewNop(),
 		reqIDGen: idutil.NewGenerator(0, time.Time{}),
@@ -787,7 +813,7 @@ func TestDoProposalStopped(t *testing.T) {
 	srv := &EtcdServer{
 		lgMu:     new(sync.RWMutex),
 		lg:       zap.NewExample(),
-		Cfg:      ServerConfig{Logger: zap.NewExample(), TickMs: 1},
+		Cfg:      ServerConfig{Logger: zap.NewExample(), TickMs: 1, SnapshotCatchUpEntries: DefaultSnapshotCatchUpEntries},
 		r:        *newRaftNode(raftNodeConfig{lg: zap.NewExample(), Node: newNodeNop()}),
 		w:        mockwait.NewNop(),
 		reqIDGen: idutil.NewGenerator(0, time.Time{}),
@@ -817,7 +843,7 @@ func TestSync(t *testing.T) {
 	srv.applyV2 = &applierV2store{store: srv.v2store, cluster: srv.cluster}
 
 	// check that sync is non-blocking
-	done := make(chan struct{})
+	done := make(chan struct{}, 1)
 	go func() {
 		srv.sync(10 * time.Second)
 		done <- struct{}{}
@@ -862,7 +888,7 @@ func TestSyncTimeout(t *testing.T) {
 	srv.applyV2 = &applierV2store{store: srv.v2store, cluster: srv.cluster}
 
 	// check that sync is non-blocking
-	done := make(chan struct{})
+	done := make(chan struct{}, 1)
 	go func() {
 		srv.sync(0)
 		done <- struct{}{}
@@ -891,14 +917,14 @@ func TestSyncTrigger(t *testing.T) {
 		lg:          zap.NewExample(),
 		Node:        n,
 		raftStorage: raft.NewMemoryStorage(),
-		transport:   rafthttp.NewNopTransporter(),
+		transport:   newNopTransporter(),
 		storage:     mockstorage.NewStorageRecorder(""),
 	})
 
 	srv := &EtcdServer{
 		lgMu:       new(sync.RWMutex),
 		lg:         zap.NewExample(),
-		Cfg:        ServerConfig{Logger: zap.NewExample(), TickMs: 1},
+		Cfg:        ServerConfig{Logger: zap.NewExample(), TickMs: 1, SnapshotCatchUpEntries: DefaultSnapshotCatchUpEntries},
 		r:          *r,
 		v2store:    mockstore.NewNop(),
 		SyncTicker: tk,
@@ -957,25 +983,30 @@ func TestSnapshot(t *testing.T) {
 		storage:     p,
 	})
 	srv := &EtcdServer{
-		lgMu:    new(sync.RWMutex),
-		lg:      zap.NewExample(),
-		r:       *r,
-		v2store: st,
+		lgMu:         new(sync.RWMutex),
+		lg:           zap.NewExample(),
+		r:            *r,
+		v2store:      st,
+		consistIndex: cindex.NewConsistentIndex(be.BatchTx()),
 	}
-	srv.kv = mvcc.New(zap.NewExample(), be, &lease.FakeLessor{}, &srv.consistIndex)
+	srv.kv = mvcc.New(zap.NewExample(), be, &lease.FakeLessor{}, srv.consistIndex, mvcc.StoreConfig{})
 	srv.be = be
 
 	ch := make(chan struct{}, 2)
 
 	go func() {
-		gaction, _ := p.Wait(1)
+		gaction, _ := p.Wait(2)
 		defer func() { ch <- struct{}{} }()
 
-		if len(gaction) != 1 {
-			t.Fatalf("len(action) = %d, want 1", len(gaction))
+		if len(gaction) != 2 {
+			t.Fatalf("len(action) = %d, want 2", len(gaction))
 		}
 		if !reflect.DeepEqual(gaction[0], testutil.Action{Name: "SaveSnap"}) {
 			t.Errorf("action = %s, want SaveSnap", gaction[0])
+		}
+
+		if !reflect.DeepEqual(gaction[1], testutil.Action{Name: "Release"}) {
+			t.Errorf("action = %s, want Release", gaction[1])
 		}
 	}()
 
@@ -984,7 +1015,7 @@ func TestSnapshot(t *testing.T) {
 		defer func() { ch <- struct{}{} }()
 
 		if len(gaction) != 2 {
-			t.Fatalf("len(action) = %d, want 2", len(gaction))
+			t.Errorf("len(action) = %d, want 2", len(gaction))
 		}
 		if !reflect.DeepEqual(gaction[0], testutil.Action{Name: "Clone"}) {
 			t.Errorf("action = %s, want Clone", gaction[0])
@@ -994,7 +1025,7 @@ func TestSnapshot(t *testing.T) {
 		}
 	}()
 
-	srv.snapshot(1, raftpb.ConfState{Nodes: []uint64{1}})
+	srv.snapshot(1, raftpb.ConfState{Voters: []uint64{1}})
 	<-ch
 	<-ch
 }
@@ -1020,7 +1051,7 @@ func TestSnapshotOrdering(t *testing.T) {
 
 	rs := raft.NewMemoryStorage()
 	p := mockstorage.NewStorageRecorderStream(testdir)
-	tr, snapDoneC := rafthttp.NewSnapTransporter(snapdir)
+	tr, snapDoneC := newSnapTransporter(snapdir)
 	r := newRaftNode(raftNodeConfig{
 		lg:          zap.NewExample(),
 		isIDRemoved: func(id uint64) bool { return cl.IsIDRemoved(types.ID(id)) },
@@ -1029,21 +1060,22 @@ func TestSnapshotOrdering(t *testing.T) {
 		storage:     p,
 		raftStorage: rs,
 	})
+	be, tmpPath := backend.NewDefaultTmpBackend()
+	defer os.RemoveAll(tmpPath)
 	s := &EtcdServer{
-		lgMu:        new(sync.RWMutex),
-		lg:          zap.NewExample(),
-		Cfg:         ServerConfig{Logger: zap.NewExample(), DataDir: testdir},
-		r:           *r,
-		v2store:     st,
-		snapshotter: raftsnap.New(zap.NewExample(), snapdir),
-		cluster:     cl,
-		SyncTicker:  &time.Ticker{},
+		lgMu:         new(sync.RWMutex),
+		lg:           zap.NewExample(),
+		Cfg:          ServerConfig{Logger: zap.NewExample(), DataDir: testdir, SnapshotCatchUpEntries: DefaultSnapshotCatchUpEntries},
+		r:            *r,
+		v2store:      st,
+		snapshotter:  snap.New(zap.NewExample(), snapdir),
+		cluster:      cl,
+		SyncTicker:   &time.Ticker{},
+		consistIndex: cindex.NewConsistentIndex(be.BatchTx()),
 	}
 	s.applyV2 = &applierV2store{store: s.v2store, cluster: s.cluster}
 
-	be, tmpPath := backend.NewDefaultTmpBackend()
-	defer os.RemoveAll(tmpPath)
-	s.kv = mvcc.New(zap.NewExample(), be, &lease.FakeLessor{}, &s.consistIndex)
+	s.kv = mvcc.New(zap.NewExample(), be, &lease.FakeLessor{}, s.consistIndex, mvcc.StoreConfig{})
 	s.be = be
 
 	s.start()
@@ -1059,24 +1091,36 @@ func TestSnapshotOrdering(t *testing.T) {
 		n.readyc <- raft.Ready{Snapshot: snapMsg.Snapshot}
 	}()
 
+	ac := <-p.Chan()
+	if ac.Name != "Save" {
+		t.Fatalf("expected Save, got %+v", ac)
+	}
+
+	if ac := <-p.Chan(); ac.Name != "SaveSnap" {
+		t.Fatalf("expected SaveSnap, got %+v", ac)
+	}
+
 	if ac := <-p.Chan(); ac.Name != "Save" {
 		t.Fatalf("expected Save, got %+v", ac)
 	}
-	if ac := <-p.Chan(); ac.Name != "Save" {
-		t.Fatalf("expected Save, got %+v", ac)
-	}
+
 	// confirm snapshot file still present before calling SaveSnap
 	snapPath := filepath.Join(snapdir, fmt.Sprintf("%016x.snap.db", 1))
 	if !fileutil.Exist(snapPath) {
 		t.Fatalf("expected file %q, got missing", snapPath)
 	}
+
 	// unblock SaveSnapshot, etcdserver now permitted to move snapshot file
-	if ac := <-p.Chan(); ac.Name != "SaveSnap" {
-		t.Fatalf("expected SaveSnap, got %+v", ac)
+	if ac := <-p.Chan(); ac.Name != "Sync" {
+		t.Fatalf("expected Sync, got %+v", ac)
+	}
+
+	if ac := <-p.Chan(); ac.Name != "Release" {
+		t.Fatalf("expected Release, got %+v", ac)
 	}
 }
 
-// Applied > SnapCount should trigger a SaveSnap event
+// Applied > SnapshotCount should trigger a SaveSnap event
 func TestTriggerSnap(t *testing.T) {
 	be, tmpPath := backend.NewDefaultTmpBackend()
 	defer func() {
@@ -1091,36 +1135,43 @@ func TestTriggerSnap(t *testing.T) {
 		Node:        newNodeCommitter(),
 		raftStorage: raft.NewMemoryStorage(),
 		storage:     p,
-		transport:   rafthttp.NewNopTransporter(),
+		transport:   newNopTransporter(),
 	})
 	srv := &EtcdServer{
-		lgMu:       new(sync.RWMutex),
-		lg:         zap.NewExample(),
-		Cfg:        ServerConfig{Logger: zap.NewExample(), TickMs: 1, SnapCount: uint64(snapc)},
-		r:          *r,
-		v2store:    st,
-		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
-		SyncTicker: &time.Ticker{},
+		lgMu:         new(sync.RWMutex),
+		lg:           zap.NewExample(),
+		Cfg:          ServerConfig{Logger: zap.NewExample(), TickMs: 1, SnapshotCount: uint64(snapc), SnapshotCatchUpEntries: DefaultSnapshotCatchUpEntries},
+		r:            *r,
+		v2store:      st,
+		reqIDGen:     idutil.NewGenerator(0, time.Time{}),
+		SyncTicker:   &time.Ticker{},
+		consistIndex: cindex.NewConsistentIndex(be.BatchTx()),
 	}
 	srv.applyV2 = &applierV2store{store: srv.v2store, cluster: srv.cluster}
 
-	srv.kv = mvcc.New(zap.NewExample(), be, &lease.FakeLessor{}, &srv.consistIndex)
+	srv.kv = mvcc.New(zap.NewExample(), be, &lease.FakeLessor{}, srv.consistIndex, mvcc.StoreConfig{})
 	srv.be = be
 
 	srv.start()
 
 	donec := make(chan struct{})
 	go func() {
-		wcnt := 2 + snapc
+		wcnt := 3 + snapc
 		gaction, _ := p.Wait(wcnt)
 
 		// each operation is recorded as a Save
-		// (SnapCount+1) * Puts + SaveSnap = (SnapCount+1) * Save + SaveSnap
+		// (SnapshotCount+1) * Puts + SaveSnap = (SnapshotCount+1) * Save + SaveSnap + Release
 		if len(gaction) != wcnt {
+			t.Logf("gaction: %v", gaction)
 			t.Fatalf("len(action) = %d, want %d", len(gaction), wcnt)
 		}
-		if !reflect.DeepEqual(gaction[wcnt-1], testutil.Action{Name: "SaveSnap"}) {
-			t.Errorf("action = %s, want SaveSnap", gaction[wcnt-1])
+
+		if !reflect.DeepEqual(gaction[wcnt-2], testutil.Action{Name: "SaveSnap"}) {
+			t.Errorf("action = %s, want SaveSnap", gaction[wcnt-2])
+		}
+
+		if !reflect.DeepEqual(gaction[wcnt-1], testutil.Action{Name: "Release"}) {
+			t.Errorf("action = %s, want Release", gaction[wcnt-1])
 		}
 		close(donec)
 	}()
@@ -1151,7 +1202,7 @@ func TestConcurrentApplyAndSnapshotV3(t *testing.T) {
 	}
 
 	rs := raft.NewMemoryStorage()
-	tr, snapDoneC := rafthttp.NewSnapTransporter(testdir)
+	tr, snapDoneC := newSnapTransporter(testdir)
 	r := newRaftNode(raftNodeConfig{
 		lg:          zap.NewExample(),
 		isIDRemoved: func(id uint64) bool { return cl.IsIDRemoved(types.ID(id)) },
@@ -1160,23 +1211,24 @@ func TestConcurrentApplyAndSnapshotV3(t *testing.T) {
 		storage:     mockstorage.NewStorageRecorder(testdir),
 		raftStorage: rs,
 	})
-	s := &EtcdServer{
-		lgMu:        new(sync.RWMutex),
-		lg:          zap.NewExample(),
-		Cfg:         ServerConfig{Logger: zap.NewExample(), DataDir: testdir},
-		r:           *r,
-		v2store:     st,
-		snapshotter: raftsnap.New(zap.NewExample(), testdir),
-		cluster:     cl,
-		SyncTicker:  &time.Ticker{},
-	}
-	s.applyV2 = &applierV2store{store: s.v2store, cluster: s.cluster}
-
 	be, tmpPath := backend.NewDefaultTmpBackend()
 	defer func() {
 		os.RemoveAll(tmpPath)
 	}()
-	s.kv = mvcc.New(zap.NewExample(), be, &lease.FakeLessor{}, &s.consistIndex)
+	s := &EtcdServer{
+		lgMu:         new(sync.RWMutex),
+		lg:           zap.NewExample(),
+		Cfg:          ServerConfig{Logger: zap.NewExample(), DataDir: testdir, SnapshotCatchUpEntries: DefaultSnapshotCatchUpEntries},
+		r:            *r,
+		v2store:      st,
+		snapshotter:  snap.New(zap.NewExample(), testdir),
+		cluster:      cl,
+		SyncTicker:   &time.Ticker{},
+		consistIndex: cindex.NewConsistentIndex(be.BatchTx()),
+	}
+	s.applyV2 = &applierV2store{store: s.v2store, cluster: s.cluster}
+
+	s.kv = mvcc.New(zap.NewExample(), be, &lease.FakeLessor{}, s.consistIndex, mvcc.StoreConfig{})
 	s.be = be
 
 	s.start()
@@ -1188,9 +1240,9 @@ func TestConcurrentApplyAndSnapshotV3(t *testing.T) {
 	accepted := 0
 	for k := 1; k <= 101; k++ {
 		idx++
-		ch := s.w.Register(uint64(idx))
-		req := &pb.Request{Method: "QGET", ID: uint64(idx)}
-		ent := raftpb.Entry{Index: uint64(idx), Data: pbutil.MustMarshal(req)}
+		ch := s.w.Register(idx)
+		req := &pb.Request{Method: "QGET", ID: idx}
+		ent := raftpb.Entry{Index: idx, Data: pbutil.MustMarshal(req)}
 		ready := raft.Ready{Entries: []raftpb.Entry{ent}}
 		n.readyc <- ready
 
@@ -1245,16 +1297,17 @@ func TestAddMember(t *testing.T) {
 		Node:        n,
 		raftStorage: raft.NewMemoryStorage(),
 		storage:     mockstorage.NewStorageRecorder(""),
-		transport:   rafthttp.NewNopTransporter(),
+		transport:   newNopTransporter(),
 	})
 	s := &EtcdServer{
-		lgMu:       new(sync.RWMutex),
-		lg:         zap.NewExample(),
-		r:          *r,
-		v2store:    st,
-		cluster:    cl,
-		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
-		SyncTicker: &time.Ticker{},
+		lgMu:         new(sync.RWMutex),
+		lg:           zap.NewExample(),
+		r:            *r,
+		v2store:      st,
+		cluster:      cl,
+		reqIDGen:     idutil.NewGenerator(0, time.Time{}),
+		SyncTicker:   &time.Ticker{},
+		consistIndex: cindex.NewFakeConsistentIndex(0),
 	}
 	s.start()
 	m := membership.Member{ID: 1234, RaftAttributes: membership.RaftAttributes{PeerURLs: []string{"foo"}}}
@@ -1289,16 +1342,17 @@ func TestRemoveMember(t *testing.T) {
 		Node:        n,
 		raftStorage: raft.NewMemoryStorage(),
 		storage:     mockstorage.NewStorageRecorder(""),
-		transport:   rafthttp.NewNopTransporter(),
+		transport:   newNopTransporter(),
 	})
 	s := &EtcdServer{
-		lgMu:       new(sync.RWMutex),
-		lg:         zap.NewExample(),
-		r:          *r,
-		v2store:    st,
-		cluster:    cl,
-		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
-		SyncTicker: &time.Ticker{},
+		lgMu:         new(sync.RWMutex),
+		lg:           zap.NewExample(),
+		r:            *r,
+		v2store:      st,
+		cluster:      cl,
+		reqIDGen:     idutil.NewGenerator(0, time.Time{}),
+		SyncTicker:   &time.Ticker{},
+		consistIndex: cindex.NewFakeConsistentIndex(0),
 	}
 	s.start()
 	_, err := s.RemoveMember(context.TODO(), 1234)
@@ -1332,16 +1386,17 @@ func TestUpdateMember(t *testing.T) {
 		Node:        n,
 		raftStorage: raft.NewMemoryStorage(),
 		storage:     mockstorage.NewStorageRecorder(""),
-		transport:   rafthttp.NewNopTransporter(),
+		transport:   newNopTransporter(),
 	})
 	s := &EtcdServer{
-		lgMu:       new(sync.RWMutex),
-		lg:         zap.NewExample(),
-		r:          *r,
-		v2store:    st,
-		cluster:    cl,
-		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
-		SyncTicker: &time.Ticker{},
+		lgMu:         new(sync.RWMutex),
+		lg:           zap.NewExample(),
+		r:            *r,
+		v2store:      st,
+		cluster:      cl,
+		reqIDGen:     idutil.NewGenerator(0, time.Time{}),
+		SyncTicker:   &time.Ticker{},
+		consistIndex: cindex.NewFakeConsistentIndex(0),
 	}
 	s.start()
 	wm := membership.Member{ID: 1234, RaftAttributes: membership.RaftAttributes{PeerURLs: []string{"http://127.0.0.1:1"}}}
@@ -1374,7 +1429,7 @@ func TestPublish(t *testing.T) {
 		lgMu:       new(sync.RWMutex),
 		lg:         zap.NewExample(),
 		readych:    make(chan struct{}),
-		Cfg:        ServerConfig{Logger: zap.NewExample(), TickMs: 1},
+		Cfg:        ServerConfig{Logger: zap.NewExample(), TickMs: 1, SnapshotCatchUpEntries: DefaultSnapshotCatchUpEntries},
 		id:         1,
 		r:          *newRaftNode(raftNodeConfig{lg: zap.NewExample(), Node: n}),
 		attributes: membership.Attributes{Name: "node1", ClientURLs: []string{"http://a", "http://b"}},
@@ -1422,12 +1477,12 @@ func TestPublishStopped(t *testing.T) {
 	r := newRaftNode(raftNodeConfig{
 		lg:        zap.NewExample(),
 		Node:      newNodeNop(),
-		transport: rafthttp.NewNopTransporter(),
+		transport: newNopTransporter(),
 	})
 	srv := &EtcdServer{
 		lgMu:       new(sync.RWMutex),
 		lg:         zap.NewExample(),
-		Cfg:        ServerConfig{Logger: zap.NewExample(), TickMs: 1},
+		Cfg:        ServerConfig{Logger: zap.NewExample(), TickMs: 1, SnapshotCatchUpEntries: DefaultSnapshotCatchUpEntries},
 		r:          *r,
 		cluster:    &membership.RaftCluster{},
 		w:          mockwait.NewNop(),
@@ -1451,7 +1506,7 @@ func TestPublishRetry(t *testing.T) {
 	srv := &EtcdServer{
 		lgMu:       new(sync.RWMutex),
 		lg:         zap.NewExample(),
-		Cfg:        ServerConfig{Logger: zap.NewExample(), TickMs: 1},
+		Cfg:        ServerConfig{Logger: zap.NewExample(), TickMs: 1, SnapshotCatchUpEntries: DefaultSnapshotCatchUpEntries},
 		r:          *newRaftNode(raftNodeConfig{lg: zap.NewExample(), Node: n}),
 		w:          mockwait.NewNop(),
 		stopping:   make(chan struct{}),
@@ -1481,53 +1536,6 @@ func TestPublishRetry(t *testing.T) {
 	srv.publish(10 * time.Nanosecond)
 	ch <- struct{}{}
 	<-ch
-}
-
-func TestUpdateVersion(t *testing.T) {
-	n := newNodeRecorder()
-	ch := make(chan interface{}, 1)
-	// simulate that request has gone through consensus
-	ch <- Response{}
-	w := wait.NewWithResponse(ch)
-	ctx, cancel := context.WithCancel(context.TODO())
-	srv := &EtcdServer{
-		lgMu:       new(sync.RWMutex),
-		lg:         zap.NewExample(),
-		id:         1,
-		Cfg:        ServerConfig{Logger: zap.NewExample(), TickMs: 1},
-		r:          *newRaftNode(raftNodeConfig{lg: zap.NewExample(), Node: n}),
-		attributes: membership.Attributes{Name: "node1", ClientURLs: []string{"http://node1.com"}},
-		cluster:    &membership.RaftCluster{},
-		w:          w,
-		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
-		SyncTicker: &time.Ticker{},
-
-		ctx:    ctx,
-		cancel: cancel,
-	}
-	srv.updateClusterVersion("2.0.0")
-
-	action := n.Action()
-	if len(action) != 1 {
-		t.Fatalf("len(action) = %d, want 1", len(action))
-	}
-	if action[0].Name != "Propose" {
-		t.Fatalf("action = %s, want Propose", action[0].Name)
-	}
-	data := action[0].Params[0].([]byte)
-	var r pb.Request
-	if err := r.Unmarshal(data); err != nil {
-		t.Fatalf("unmarshal request error: %v", err)
-	}
-	if r.Method != "PUT" {
-		t.Errorf("method = %s, want PUT", r.Method)
-	}
-	if wpath := path.Join(StoreClusterPrefix, "version"); r.Path != wpath {
-		t.Errorf("path = %s, want %s", r.Path, wpath)
-	}
-	if r.Val != "2.0.0" {
-		t.Errorf("val = %s, want %s", r.Val, "2.0.0")
-	}
 }
 
 func TestStopNotify(t *testing.T) {
@@ -1609,7 +1617,7 @@ func (n *nodeRecorder) Propose(ctx context.Context, data []byte) error {
 	n.Record(testutil.Action{Name: "Propose", Params: []interface{}{data}})
 	return nil
 }
-func (n *nodeRecorder) ProposeConfChange(ctx context.Context, conf raftpb.ConfChange) error {
+func (n *nodeRecorder) ProposeConfChange(ctx context.Context, conf raftpb.ConfChangeI) error {
 	n.Record(testutil.Action{Name: "ProposeConfChange"})
 	return nil
 }
@@ -1622,7 +1630,7 @@ func (n *nodeRecorder) Ready() <-chan raft.Ready                                
 func (n *nodeRecorder) TransferLeadership(ctx context.Context, lead, transferee uint64) {}
 func (n *nodeRecorder) ReadIndex(ctx context.Context, rctx []byte) error                { return nil }
 func (n *nodeRecorder) Advance()                                                        {}
-func (n *nodeRecorder) ApplyConfChange(conf raftpb.ConfChange) *raftpb.ConfState {
+func (n *nodeRecorder) ApplyConfChange(conf raftpb.ConfChangeI) *raftpb.ConfState {
 	n.Record(testutil.Action{Name: "ApplyConfChange", Params: []interface{}{conf}})
 	return &raftpb.ConfState{}
 }
@@ -1683,21 +1691,37 @@ func newNodeConfChangeCommitterStream() *nodeConfChangeCommitterRecorder {
 	return &nodeConfChangeCommitterRecorder{*newReadyNode(), 0}
 }
 
-func (n *nodeConfChangeCommitterRecorder) ProposeConfChange(ctx context.Context, conf raftpb.ConfChange) error {
-	data, err := conf.Marshal()
+func confChangeActionName(conf raftpb.ConfChangeI) string {
+	var s string
+	if confV1, ok := conf.AsV1(); ok {
+		s = confV1.Type.String()
+	} else {
+		for i, chg := range conf.AsV2().Changes {
+			if i > 0 {
+				s += "/"
+			}
+			s += chg.Type.String()
+		}
+	}
+	return s
+}
+
+func (n *nodeConfChangeCommitterRecorder) ProposeConfChange(ctx context.Context, conf raftpb.ConfChangeI) error {
+	typ, data, err := raftpb.MarshalConfChange(conf)
 	if err != nil {
 		return err
 	}
+
 	n.index++
-	n.Record(testutil.Action{Name: "ProposeConfChange:" + conf.Type.String()})
-	n.readyc <- raft.Ready{CommittedEntries: []raftpb.Entry{{Index: n.index, Type: raftpb.EntryConfChange, Data: data}}}
+	n.Record(testutil.Action{Name: "ProposeConfChange:" + confChangeActionName(conf)})
+	n.readyc <- raft.Ready{CommittedEntries: []raftpb.Entry{{Index: n.index, Type: typ, Data: data}}}
 	return nil
 }
 func (n *nodeConfChangeCommitterRecorder) Ready() <-chan raft.Ready {
 	return n.readyc
 }
-func (n *nodeConfChangeCommitterRecorder) ApplyConfChange(conf raftpb.ConfChange) *raftpb.ConfState {
-	n.Record(testutil.Action{Name: "ApplyConfChange:" + conf.Type.String()})
+func (n *nodeConfChangeCommitterRecorder) ApplyConfChange(conf raftpb.ConfChangeI) *raftpb.ConfState {
+	n.Record(testutil.Action{Name: "ApplyConfChange:" + confChangeActionName(conf)})
 	return &raftpb.ConfState{}
 }
 
@@ -1726,4 +1750,65 @@ func newTestCluster(membs []*membership.Member) *membership.RaftCluster {
 		c.AddMember(m)
 	}
 	return c
+}
+
+type nopTransporter struct{}
+
+func newNopTransporter() rafthttp.Transporter {
+	return &nopTransporter{}
+}
+
+func (s *nopTransporter) Start() error                        { return nil }
+func (s *nopTransporter) Handler() http.Handler               { return nil }
+func (s *nopTransporter) Send(m []raftpb.Message)             {}
+func (s *nopTransporter) SendSnapshot(m snap.Message)         {}
+func (s *nopTransporter) AddRemote(id types.ID, us []string)  {}
+func (s *nopTransporter) AddPeer(id types.ID, us []string)    {}
+func (s *nopTransporter) RemovePeer(id types.ID)              {}
+func (s *nopTransporter) RemoveAllPeers()                     {}
+func (s *nopTransporter) UpdatePeer(id types.ID, us []string) {}
+func (s *nopTransporter) ActiveSince(id types.ID) time.Time   { return time.Time{} }
+func (s *nopTransporter) ActivePeers() int                    { return 0 }
+func (s *nopTransporter) Stop()                               {}
+func (s *nopTransporter) Pause()                              {}
+func (s *nopTransporter) Resume()                             {}
+
+type snapTransporter struct {
+	nopTransporter
+	snapDoneC chan snap.Message
+	snapDir   string
+}
+
+func newSnapTransporter(snapDir string) (rafthttp.Transporter, <-chan snap.Message) {
+	ch := make(chan snap.Message, 1)
+	tr := &snapTransporter{snapDoneC: ch, snapDir: snapDir}
+	return tr, ch
+}
+
+func (s *snapTransporter) SendSnapshot(m snap.Message) {
+	ss := snap.New(zap.NewExample(), s.snapDir)
+	ss.SaveDBFrom(m.ReadCloser, m.Snapshot.Metadata.Index+1)
+	m.CloseWithError(nil)
+	s.snapDoneC <- m
+}
+
+type sendMsgAppRespTransporter struct {
+	nopTransporter
+	sendC chan int
+}
+
+func newSendMsgAppRespTransporter() (rafthttp.Transporter, <-chan int) {
+	ch := make(chan int, 1)
+	tr := &sendMsgAppRespTransporter{sendC: ch}
+	return tr, ch
+}
+
+func (s *sendMsgAppRespTransporter) Send(m []raftpb.Message) {
+	var send int
+	for _, msg := range m {
+		if msg.To != 0 {
+			send++
+		}
+	}
+	s.sendC <- send
 }

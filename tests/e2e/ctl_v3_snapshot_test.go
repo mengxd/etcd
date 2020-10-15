@@ -25,9 +25,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coreos/etcd/pkg/expect"
-	"github.com/coreos/etcd/pkg/testutil"
-	"github.com/coreos/etcd/snapshot"
+	"go.etcd.io/etcd/pkg/v3/expect"
+	"go.etcd.io/etcd/pkg/v3/testutil"
+	"go.etcd.io/etcd/v3/etcdctl/snapshot"
 )
 
 func TestCtlV3Snapshot(t *testing.T) { testCtl(t, snapshotTest) }
@@ -43,7 +43,7 @@ func snapshotTest(cx ctlCtx) {
 		cx.t.Fatalf("snapshot: ctlV3Put error (%v)", err)
 	}
 
-	fpath := "test.snapshot"
+	fpath := "test1.snapshot"
 	defer os.RemoveAll(fpath)
 
 	if err = ctlV3SnapshotSave(cx, fpath); err != nil {
@@ -65,7 +65,7 @@ func snapshotTest(cx ctlCtx) {
 func TestCtlV3SnapshotCorrupt(t *testing.T) { testCtl(t, snapshotCorruptTest) }
 
 func snapshotCorruptTest(cx ctlCtx) {
-	fpath := "test.snapshot"
+	fpath := "test2.snapshot"
 	defer os.RemoveAll(fpath)
 
 	if err := ctlV3SnapshotSave(cx, fpath); err != nil {
@@ -98,7 +98,7 @@ func snapshotCorruptTest(cx ctlCtx) {
 func TestCtlV3SnapshotStatusBeforeRestore(t *testing.T) { testCtl(t, snapshotStatusBeforeRestoreTest) }
 
 func snapshotStatusBeforeRestoreTest(cx ctlCtx) {
-	fpath := "test.snapshot"
+	fpath := "test3.snapshot"
 	defer os.RemoveAll(fpath)
 
 	if err := ctlV3SnapshotSave(cx, fpath); err != nil {
@@ -155,11 +155,10 @@ func getSnapshotStatus(cx ctlCtx, fpath string) (snapshot.Status, error) {
 // syncs up with other members and serve correct data.
 func TestIssue6361(t *testing.T) {
 	defer testutil.AfterTest(t)
-	mustEtcdctl(t)
 	os.Setenv("ETCDCTL_API", "3")
 	defer os.Unsetenv("ETCDCTL_API")
 
-	epc, err := newEtcdProcessCluster(&etcdProcessClusterConfig{
+	epc, err := newEtcdProcessCluster(t, &etcdProcessClusterConfig{
 		clusterSize:  1,
 		initialToken: "new",
 		keepDataDir:  true,

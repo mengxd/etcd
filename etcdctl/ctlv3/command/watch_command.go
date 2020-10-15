@@ -23,7 +23,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/coreos/etcd/clientv3"
+	"go.etcd.io/etcd/v3/clientv3"
 
 	"github.com/spf13/cobra"
 )
@@ -40,6 +40,7 @@ var (
 	watchPrefix      bool
 	watchInteractive bool
 	watchPrevKey     bool
+	progressNotify   bool
 )
 
 // NewWatchCommand returns the cobra command for "watch".
@@ -54,6 +55,7 @@ func NewWatchCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&watchPrefix, "prefix", false, "Watch on a prefix if prefix is set")
 	cmd.Flags().Int64Var(&watchRev, "rev", 0, "Revision to start watching")
 	cmd.Flags().BoolVar(&watchPrevKey, "prev-kv", false, "get the previous key-value pair before the event happens")
+	cmd.Flags().BoolVar(&progressNotify, "progress-notify", false, "get periodic watch progress notification from server")
 
 	return cmd
 }
@@ -101,27 +103,37 @@ func watchInteractiveFunc(cmd *cobra.Command, osArgs []string, envKey, envRange 
 		l = strings.TrimSuffix(l, "\n")
 
 		args := argify(l)
-		if len(args) < 2 && envKey == "" {
-			fmt.Fprintf(os.Stderr, "Invalid command %s (command type or key is not provided)\n", l)
+		if len(args) < 1 {
+			fmt.Fprintf(os.Stderr, "Invalid command: %s (watch and progress supported)\n", l)
 			continue
 		}
+		switch args[0] {
+		case "watch":
+			if len(args) < 2 && envKey == "" {
+				fmt.Fprintf(os.Stderr, "Invalid command %s (command type or key is not provided)\n", l)
+				continue
+			}
+			watchArgs, execArgs, perr := parseWatchArgs(osArgs, args, envKey, envRange, true)
+			if perr != nil {
+				ExitWithError(ExitBadArgs, perr)
+			}
 
-		if args[0] != "watch" {
+			ch, err := getWatchChan(c, watchArgs)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Invalid command %s (%v)\n", l, err)
+				continue
+			}
+			go printWatchCh(c, ch, execArgs)
+		case "progress":
+			err := c.RequestProgress(clientv3.WithRequireLeader(context.Background()))
+			if err != nil {
+				ExitWithError(ExitError, err)
+			}
+		default:
 			fmt.Fprintf(os.Stderr, "Invalid command %s (only support watch)\n", l)
 			continue
 		}
 
-		watchArgs, execArgs, perr := parseWatchArgs(osArgs, args, envKey, envRange, true)
-		if perr != nil {
-			ExitWithError(ExitBadArgs, perr)
-		}
-
-		ch, err := getWatchChan(c, watchArgs)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Invalid command %s (%v)\n", l, err)
-			continue
-		}
-		go printWatchCh(c, ch, execArgs)
 	}
 }
 
@@ -144,6 +156,9 @@ func getWatchChan(c *clientv3.Client, args []string) (clientv3.WatchChan, error)
 	if watchPrevKey {
 		opts = append(opts, clientv3.WithPrevKV())
 	}
+	if progressNotify {
+		opts = append(opts, clientv3.WithProgressNotify())
+	}
 	return c.Watch(clientv3.WithRequireLeader(context.Background()), key, opts...), nil
 }
 
@@ -151,6 +166,9 @@ func printWatchCh(c *clientv3.Client, ch clientv3.WatchChan, execArgs []string) 
 	for resp := range ch {
 		if resp.Canceled {
 			fmt.Fprintf(os.Stderr, "watch was canceled (%v)\n", resp.Err())
+		}
+		if resp.IsProgressNotify() {
+			fmt.Fprintf(os.Stdout, "progress notify: %d\n", resp.Header.Revision)
 		}
 		display.Watch(resp)
 
@@ -258,9 +276,9 @@ func parseWatchArgs(osArgs, commandArgs []string, envKey, envRange string, inter
 		}
 
 		flagset := NewWatchCommand().Flags()
-		if err := flagset.Parse(watchArgs); err != nil {
+		if perr := flagset.Parse(watchArgs); perr != nil {
 			watchPrefix, watchRev, watchPrevKey = false, 0, false
-			return nil, nil, err
+			return nil, nil, perr
 		}
 		pArgs := flagset.Args()
 
@@ -298,8 +316,8 @@ func parseWatchArgs(osArgs, commandArgs []string, envKey, envRange string, inter
 
 	if interactive {
 		flagset := NewWatchCommand().Flags()
-		if err := flagset.Parse(argsWithSep); err != nil {
-			return nil, nil, err
+		if perr := flagset.Parse(argsWithSep); perr != nil {
+			return nil, nil, perr
 		}
 		watchArgs = flagset.Args()
 

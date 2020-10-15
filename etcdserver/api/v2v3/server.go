@@ -19,12 +19,12 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/etcdserver"
-	"github.com/coreos/etcd/etcdserver/api"
-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
-	"github.com/coreos/etcd/etcdserver/membership"
-	"github.com/coreos/etcd/pkg/types"
+	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.etcd.io/etcd/pkg/v3/types"
+	"go.etcd.io/etcd/v3/clientv3"
+	"go.etcd.io/etcd/v3/etcdserver"
+	"go.etcd.io/etcd/v3/etcdserver/api"
+	"go.etcd.io/etcd/v3/etcdserver/api/membership"
 
 	"github.com/coreos/go-semver/semver"
 	"go.uber.org/zap"
@@ -44,7 +44,7 @@ type v2v3Server struct {
 }
 
 func NewServer(lg *zap.Logger, c *clientv3.Client, pfx string) etcdserver.ServerPeer {
-	return &v2v3Server{c: c, store: newStore(c, pfx)}
+	return &v2v3Server{lg: lg, c: c, store: newStore(c, pfx)}
 }
 
 func (s *v2v3Server) ClientCertAuthEnabled() bool { return false }
@@ -63,6 +63,7 @@ func (s *v2v3Server) Leader() types.ID {
 }
 
 func (s *v2v3Server) AddMember(ctx context.Context, memb membership.Member) ([]*membership.Member, error) {
+	// adding member as learner is not supported by V2 Server.
 	resp, err := s.c.MemberAdd(ctx, memb.PeerURLs)
 	if err != nil {
 		return nil, err
@@ -72,6 +73,14 @@ func (s *v2v3Server) AddMember(ctx context.Context, memb membership.Member) ([]*
 
 func (s *v2v3Server) RemoveMember(ctx context.Context, id uint64) ([]*membership.Member, error) {
 	resp, err := s.c.MemberRemove(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return v3MembersToMembership(resp.Members), nil
+}
+
+func (s *v2v3Server) PromoteMember(ctx context.Context, id uint64) ([]*membership.Member, error) {
+	resp, err := s.c.MemberPromote(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +101,8 @@ func v3MembersToMembership(v3membs []*pb.Member) []*membership.Member {
 		membs[i] = &membership.Member{
 			ID: types.ID(m.ID),
 			RaftAttributes: membership.RaftAttributes{
-				PeerURLs: m.PeerURLs,
+				PeerURLs:  m.PeerURLs,
+				IsLearner: m.IsLearner,
 			},
 			Attributes: membership.Attributes{
 				Name:       m.Name,

@@ -25,8 +25,8 @@ import (
 	"sync"
 	"time"
 
-	v3 "github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/pkg/report"
+	"go.etcd.io/etcd/pkg/v3/report"
+	v3 "go.etcd.io/etcd/v3/clientv3"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
@@ -96,7 +96,7 @@ var checkDatascaleCfgMap = map[string]checkDatascaleCfg{
 	},
 	"xl": {
 		// xl tries to hit the upper bound aggressively which is 3 versions of 1M objects (3M in total)
-		limit:   30000000,
+		limit:   3000000,
 		kvSize:  1024,
 		clients: 1000,
 	},
@@ -163,7 +163,7 @@ func newCheckPerfCommand(cmd *cobra.Command, args []string) {
 		ExitWithError(ExitError, err)
 	}
 	if len(resp.Kvs) > 0 {
-		ExitWithError(ExitInvalidInput, fmt.Errorf("prefix %q has keys. Delete with etcdctl del --prefix %s first.", checkPerfPrefix, checkPerfPrefix))
+		ExitWithError(ExitInvalidInput, fmt.Errorf("prefix %q has keys. Delete with etcdctl del --prefix %s first", checkPerfPrefix, checkPerfPrefix))
 	}
 
 	ksize, vsize := 256, 1024
@@ -318,7 +318,7 @@ func newCheckDatascaleCommand(cmd *cobra.Command, args []string) {
 		ExitWithError(ExitError, err)
 	}
 	if len(resp.Kvs) > 0 {
-		ExitWithError(ExitInvalidInput, fmt.Errorf("prefix %q has keys. Delete with etcdctl del --prefix %s first.", checkDatascalePrefix, checkDatascalePrefix))
+		ExitWithError(ExitInvalidInput, fmt.Errorf("prefix %q has keys. Delete with etcdctl del --prefix %s first", checkDatascalePrefix, checkDatascalePrefix))
 	}
 
 	ksize, vsize := 512, 512
@@ -336,6 +336,10 @@ func newCheckDatascaleCommand(cmd *cobra.Command, args []string) {
 	}
 
 	fmt.Println(fmt.Sprintf("Start data scale check for work load [%v key-value pairs, %v bytes per key-value, %v concurrent clients].", cfg.limit, cfg.kvSize, cfg.clients))
+	bar := pb.New(cfg.limit)
+	bar.Format("Bom !")
+	bar.Start()
+
 	for i := range clients {
 		go func(c *v3.Client) {
 			defer wg.Done()
@@ -343,6 +347,7 @@ func newCheckDatascaleCommand(cmd *cobra.Command, args []string) {
 				st := time.Now()
 				_, derr := c.Do(context.Background(), op)
 				r.Results() <- report.Result{Err: derr, Start: st, End: time.Now()}
+				bar.Increment()
 			}
 		}(clients[i])
 	}
@@ -358,6 +363,7 @@ func newCheckDatascaleCommand(cmd *cobra.Command, args []string) {
 	sc := r.Stats()
 	wg.Wait()
 	close(r.Results())
+	bar.Finish()
 	s := <-sc
 
 	// get the process_resident_memory_bytes after the put operations

@@ -18,14 +18,15 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/clientv3/concurrency"
-	"github.com/coreos/etcd/etcdserver/v2error"
-	"github.com/coreos/etcd/etcdserver/v2store"
-	"github.com/coreos/etcd/mvcc/mvccpb"
+	"go.etcd.io/etcd/api/v3/mvccpb"
+	"go.etcd.io/etcd/v3/clientv3"
+	"go.etcd.io/etcd/v3/clientv3/concurrency"
+	"go.etcd.io/etcd/v3/etcdserver/api/v2error"
+	"go.etcd.io/etcd/v3/etcdserver/api/v2store"
 )
 
 // store implements the Store interface for V2 using
@@ -94,6 +95,9 @@ func (s *v2v3Store) Get(nodePath string, recursive, sorted bool) (*v2store.Event
 func (s *v2v3Store) getDir(nodePath string, recursive, sorted bool, rev int64) ([]*v2store.NodeExtern, error) {
 	rootNodes, err := s.getDirDepth(nodePath, 1, rev)
 	if err != nil || !recursive {
+		if sorted {
+			sort.Sort(v2store.NodeExterns(rootNodes))
+		}
 		return rootNodes, err
 	}
 	nextNodes := rootNodes
@@ -109,6 +113,10 @@ func (s *v2v3Store) getDir(nodePath string, recursive, sorted bool, rev int64) (
 		if nextNodes, err = s.getDirDepth(nodePath, i, rev); err != nil {
 			return nil, err
 		}
+	}
+
+	if sorted {
+		sort.Sort(v2store.NodeExterns(rootNodes))
 	}
 	return rootNodes, nil
 }
@@ -523,8 +531,8 @@ func compareFail(nodePath, prevValue string, prevIndex uint64, resp *clientv3.Tx
 		return v2error.NewError(v2error.EcodeKeyNotFound, nodePath, mkV2Rev(resp.Header.Revision))
 	}
 	kv := kvs[0]
-	indexMatch := (prevIndex == 0 || kv.ModRevision == int64(prevIndex))
-	valueMatch := (prevValue == "" || string(kv.Value) == prevValue)
+	indexMatch := prevIndex == 0 || kv.ModRevision == int64(prevIndex)
+	valueMatch := prevValue == "" || string(kv.Value) == prevValue
 	var cause string
 	switch {
 	case indexMatch && !valueMatch:

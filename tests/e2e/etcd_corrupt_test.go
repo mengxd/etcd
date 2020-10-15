@@ -23,10 +23,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/mvcc/mvccpb"
+	"go.etcd.io/etcd/api/v3/mvccpb"
+	"go.etcd.io/etcd/v3/clientv3"
 
-	bolt "github.com/coreos/bbolt"
+	bolt "go.etcd.io/bbolt"
 )
 
 // TODO: test with embedded etcd in integration package
@@ -39,7 +39,7 @@ func TestEtcdCorruptHash(t *testing.T) {
 	cfg := configNoTLS
 
 	// trigger snapshot so that restart member can load peers from disk
-	cfg.snapCount = 3
+	cfg.snapshotCount = 3
 
 	testCtl(t, corruptTest, withQuorum(),
 		withCfg(cfg),

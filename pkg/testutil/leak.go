@@ -21,14 +21,10 @@ CheckLeakedGoroutine verifies tests do not leave any leaky
 goroutines. It returns true when there are goroutines still
 running(leaking) after all tests.
 
-	import "github.com/coreos/etcd/pkg/testutil"
+	import "go.etcd.io/etcd/pkg/v3/testutil"
 
 	func TestMain(m *testing.M) {
-		v := m.Run()
-		if v == 0 && testutil.CheckLeakedGoroutine() {
-			os.Exit(1)
-		}
-		os.Exit(v)
+		testutil.MustTestMainWithLeakDetection(m)
 	}
 
 	func TestSample(t *testing.T) {
@@ -38,10 +34,6 @@ running(leaking) after all tests.
 
 */
 func CheckLeakedGoroutine() bool {
-	if testing.Short() {
-		// not counting goroutines for leakage in -short mode
-		return false
-	}
 	gs := interestingGoroutines()
 	if len(gs) == 0 {
 		return false
@@ -55,7 +47,7 @@ func CheckLeakedGoroutine() bool {
 		stackCount[normalized]++
 	}
 
-	fmt.Fprintf(os.Stderr, "Too many goroutines running after all test(s).\n")
+	fmt.Fprintf(os.Stderr, "Unexpected goroutines running after all test(s).\n")
 	for stack, count := range stackCount {
 		fmt.Fprintf(os.Stderr, "%d instances of:\n%s\n", count, stack)
 	}
@@ -63,20 +55,18 @@ func CheckLeakedGoroutine() bool {
 }
 
 // CheckAfterTest returns an error if AfterTest would fail with an error.
+// Waits for go-routines shutdown for 'd'.
 func CheckAfterTest(d time.Duration) error {
 	http.DefaultTransport.(*http.Transport).CloseIdleConnections()
-	if testing.Short() {
-		return nil
-	}
 	var bad string
 	badSubstring := map[string]string{
-		").writeLoop(":                                 "a Transport",
+		").writeLoop(": "a Transport",
 		"created by net/http/httptest.(*Server).Start": "an httptest.Server",
-		"timeoutHandler":                               "a TimeoutHandler",
-		"net.(*netFD).connect(":                        "a timing out dial",
-		").noteClientGone(":                            "a closenotifier sender",
-		").readLoop(":                                  "a Transport",
-		".grpc":                                        "a gRPC resource",
+		"timeoutHandler":        "a TimeoutHandler",
+		"net.(*netFD).connect(": "a timing out dial",
+		").noteClientGone(":     "a closenotifier sender",
+		").readLoop(":           "a Transport",
+		".grpc":                 "a gRPC resource",
 	}
 
 	var stacks string
@@ -123,12 +113,14 @@ func interestingGoroutines() (gs []string) {
 			strings.Contains(stack, "created by os/signal.init") ||
 			strings.Contains(stack, "runtime/panic.go") ||
 			strings.Contains(stack, "created by testing.RunTests") ||
+			strings.Contains(stack, "created by testing.runTests") ||
 			strings.Contains(stack, "testing.Main(") ||
 			strings.Contains(stack, "runtime.goexit") ||
-			strings.Contains(stack, "github.com/coreos/etcd/pkg/testutil.interestingGoroutines") ||
-			strings.Contains(stack, "github.com/coreos/etcd/pkg/logutil.(*MergeLogger).outputLoop") ||
+			strings.Contains(stack, "go.etcd.io/etcd/pkg/v3/testutil.interestingGoroutines") ||
+			strings.Contains(stack, "go.etcd.io/etcd/pkg/v3/logutil.(*MergeLogger).outputLoop") ||
 			strings.Contains(stack, "github.com/golang/glog.(*loggingT).flushDaemon") ||
 			strings.Contains(stack, "created by runtime.gc") ||
+			strings.Contains(stack, "created by text/template/parse.lex") ||
 			strings.Contains(stack, "runtime.MHeap_Scavenger") {
 			continue
 		}
@@ -136,4 +128,27 @@ func interestingGoroutines() (gs []string) {
 	}
 	sort.Strings(gs)
 	return gs
+}
+
+func MustCheckLeakedGoroutine() {
+	http.DefaultTransport.(*http.Transport).CloseIdleConnections()
+
+	CheckAfterTest(5 * time.Second)
+
+	// Let the other goroutines finalize.
+	runtime.Gosched()
+
+	if CheckLeakedGoroutine() {
+		os.Exit(1)
+	}
+}
+
+// MustTestMainWithLeakDetection expands standard m.Run with leaked
+// goroutines detection.
+func MustTestMainWithLeakDetection(m *testing.M) {
+	v := m.Run()
+	if v == 0 {
+		MustCheckLeakedGoroutine()
+	}
+	os.Exit(v)
 }

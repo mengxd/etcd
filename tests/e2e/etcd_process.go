@@ -19,8 +19,8 @@ import (
 	"net/url"
 	"os"
 
-	"github.com/coreos/etcd/pkg/expect"
-	"github.com/coreos/etcd/pkg/fileutil"
+	"go.etcd.io/etcd/pkg/v3/expect"
+	"go.etcd.io/etcd/pkg/v3/fileutil"
 )
 
 var (
@@ -70,7 +70,7 @@ type etcdServerProcessConfig struct {
 
 func newEtcdServerProcess(cfg *etcdServerProcessConfig) (*etcdServerProcess, error) {
 	if !fileutil.Exist(cfg.execPath) {
-		return nil, fmt.Errorf("could not find etcd binary")
+		return nil, fmt.Errorf("could not find etcd binary: %s", cfg.execPath)
 	}
 	if !cfg.keepDataDir {
 		if err := os.RemoveAll(cfg.dataDirPath); err != nil {
@@ -104,18 +104,22 @@ func (ep *etcdServerProcess) Restart() error {
 	return ep.Start()
 }
 
-func (ep *etcdServerProcess) Stop() error {
+func (ep *etcdServerProcess) Stop() (err error) {
 	if ep == nil || ep.proc == nil {
 		return nil
 	}
-	if err := ep.proc.Stop(); err != nil {
+	err = ep.proc.Stop()
+	if err != nil {
 		return err
 	}
 	ep.proc = nil
 	<-ep.donec
 	ep.donec = make(chan struct{})
 	if ep.cfg.purl.Scheme == "unix" || ep.cfg.purl.Scheme == "unixs" {
-		os.Remove(ep.cfg.purl.Host + ep.cfg.purl.Path)
+		err = os.Remove(ep.cfg.purl.Host + ep.cfg.purl.Path)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	return nil
 }

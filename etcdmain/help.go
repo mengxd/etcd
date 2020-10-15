@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/coreos/etcd/embed"
+	"go.etcd.io/etcd/v3/embed"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -35,7 +35,7 @@ var (
     Show the help information about etcd.
 
   etcd --config-file
-    Path to the server configuration file.
+    Path to the server configuration file. Note that if a configuration file is provided, other command line flags and environment variables will be ignored.
 
   etcd gateway
     Run the stateless pass-through etcd TCP connection forwarding proxy.
@@ -69,6 +69,12 @@ Member:
     Maximum number of wal files to retain (0 is unlimited).
   --quota-backend-bytes '0'
     Raise alarms when backend size exceeds the given quota (0 defaults to low space quota).
+  --backend-bbolt-freelist-type 'map'
+    BackendFreelistType specifies the type of freelist that boltdb backend uses(array and map are supported types).
+  --backend-batch-interval ''
+    BackendBatchInterval is the maximum time before commit the backend transaction.
+  --backend-batch-limit '0'
+    BackendBatchLimit is the maximum operations before commit the backend transaction.
   --max-txn-ops '128'
     Maximum number of operations permitted in a transaction.
   --max-request-bytes '1572864'
@@ -124,6 +130,8 @@ Security:
     Enable client cert authentication.
   --client-crl-file ''
     Path to the client certificate revocation list file.
+  --client-cert-allowed-hostname ''
+    Allowed TLS hostname for client cert authentication.
   --trusted-ca-file ''
     Path to the client server TLS trusted CA cert file.
   --auto-tls 'false'
@@ -138,10 +146,14 @@ Security:
     Path to the peer server TLS trusted CA file.
   --peer-cert-allowed-cn ''
     Required CN for client certs connecting to the peer endpoint.
+  --peer-cert-allowed-hostname ''
+    Allowed TLS hostname for inter peer authentication.
   --peer-auto-tls 'false'
     Peer TLS using self-generated certificates if --peer-key-file and --peer-cert-file are not provided.
   --peer-crl-file ''
     Path to the peer certificate revocation list file.
+  --cipher-suites ''
+    Comma-separated list of supported TLS cipher suites between client/server and peers (empty will be auto-populated by Go).
   --cors '*'
     Comma-separated whitelist of origins for CORS, or cross-origin resource sharing, (empty or * means allow all).
   --host-whitelist '*'
@@ -152,26 +164,24 @@ Auth:
     Specify a v3 authentication token type and its options ('simple' or 'jwt').
   --bcrypt-cost ` + fmt.Sprintf("%d", bcrypt.DefaultCost) + `
     Specify the cost / strength of the bcrypt algorithm for hashing auth passwords. Valid values are between ` + fmt.Sprintf("%d", bcrypt.MinCost) + ` and ` + fmt.Sprintf("%d", bcrypt.MaxCost) + `.
+  --auth-token-ttl 300
+    Time (in seconds) of the auth-token-ttl.
 
 Profiling and Monitoring:
   --enable-pprof 'false'
     Enable runtime profiling data via HTTP server. Address is at client URL + "/debug/pprof/"
   --metrics 'basic'
-    Set level of detail for exported metrics, specify 'extensive' to include histogram metrics.
+    Set level of detail for exported metrics, specify 'extensive' to include server side grpc histogram metrics.
   --listen-metrics-urls ''
     List of URLs to listen on for the metrics and health endpoints.
 
 Logging:
-  --logger 'capnslog'
-    Specify 'zap' for structured logging or 'capnslog'.
+  --logger 'zap'
+    Currently only supports 'zap' for structured logging.
   --log-outputs 'default'
     Specify 'stdout' or 'stderr' to skip journald logging even when running under systemd, or list of comma separated output targets.
-  --debug 'false'
-    Enable debug-level logging for etcd.
-
-Logging (to be deprecated in v3.5):
-  --log-package-levels ''
-    Specify a particular log level for each etcd package (eg: 'etcdmain=CRITICAL,etcdserver=DEBUG').
+  --log-level 'info'
+    Configures log level. Only supports debug, info, warn, error, panic, or fatal.
 
 v2 Proxy (to be deprecated in v4):
   --proxy 'off'
@@ -194,11 +204,23 @@ Experimental feature:
     Duration of time between cluster corruption check passes.
   --experimental-enable-v2v3 ''
     Serve v2 requests through the v3 backend under a given prefix.
+  --experimental-enable-lease-checkpoint 'false'
+    ExperimentalEnableLeaseCheckpoint enables primary lessor to persist lease remainingTTL to prevent indefinite auto-renewal of long lived leases.
+  --experimental-compaction-batch-limit 1000
+    ExperimentalCompactionBatchLimit sets the maximum revisions deleted in each compaction batch.
+  --experimental-peer-skip-client-san-verification 'false'
+    Skip verification of SAN field in client certificate for peer connections.
+  --experimental-watch-progress-notify-interval '10m'
+    Duration of periodical watch progress notification.
 
 Unsafe feature:
   --force-new-cluster 'false'
     Force to create a new one-member cluster.
+  --unsafe-no-fsync 'false'
+    Disables fsync, unsafe, will cause data loss.
 
 CAUTIOUS with unsafe flag! It may break the guarantees given by the consensus protocol!
 `
 )
+
+// Add back "TO BE DEPRECATED" section if needed

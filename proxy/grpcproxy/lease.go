@@ -21,12 +21,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
+	"go.etcd.io/etcd/v3/clientv3"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 type leaseProxy struct {
@@ -46,13 +48,13 @@ type leaseProxy struct {
 	wg sync.WaitGroup
 }
 
-func NewLeaseProxy(c *clientv3.Client) (pb.LeaseServer, <-chan struct{}) {
-	cctx, cancel := context.WithCancel(c.Ctx())
+func NewLeaseProxy(ctx context.Context, c *clientv3.Client) (pb.LeaseServer, <-chan struct{}) {
+	cctx, cancel := context.WithCancel(ctx)
 	lp := &leaseProxy{
 		leaseClient: pb.NewLeaseClient(c.ActiveConnection()),
 		lessor:      c.Lease,
 		ctx:         cctx,
-		leader:      newLeader(c.Ctx(), c.Watcher),
+		leader:      newLeader(cctx, c.Watcher),
 	}
 	ch := make(chan struct{})
 	go func() {
@@ -214,7 +216,7 @@ func (lp *leaseProxy) LeaseKeepAlive(stream pb.Lease_LeaseKeepAliveServer) error
 	case <-lostLeaderC:
 		return rpctypes.ErrNoLeader
 	case <-lp.leader.disconnectNotify():
-		return grpc.ErrClientConnClosing
+		return status.Error(codes.Canceled, "the client connection is closing")
 	default:
 		if err != nil {
 			return err
